@@ -1,0 +1,350 @@
+//! Emulated stepper motor for Klipper MCU protocol.
+//!
+//! Converts Klipper's `(interval, count, add)` step commands into accumulated
+//! position values suitable for the TMC4671's position target register.
+
+use heapless::Deque;
+
+/// A single move segment from Klipper's `queue_step` command.
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub struct StepMove {
+    /// Clock ticks between steps (initial value for this segment).
+    pub interval: u32,
+    /// Number of steps in this segment.
+    pub count: u16,
+    /// Interval change per step (acceleration).
+    pub add: i16,
+}
+
+/// Emulates a stepper motor for Klipper.
+///
+/// Converts Klipper's `(interval, count, add)` step commands into
+/// accumulated position values suitable for the TMC4671's position target.
+pub struct EmulatedStepper {
+    /// Queued move segments.
+    moves: Deque<StepMove, 1024>,
+    /// Current step interval (ticks between steps).
+    interval: u32,
+    /// Steps remaining in current segment.
+    count: u16,
+    /// Interval change per step.
+    add: i16,
+    /// Clock time of the next step.
+    next_step_clock: u32,
+    /// Accumulated position in steps (signed, bidirectional).
+    position: i32,
+    /// Current direction: 1 for forward, -1 for backward.
+    direction: i32,
+    /// Step width in TMC4671 position units per step.
+    step_width: i32,
+    /// Whether the stepper is enabled.
+    enabled: bool,
+}
+
+impl Default for EmulatedStepper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmulatedStepper {
+    /// Create a new `EmulatedStepper` in the disabled state with default settings.
+    pub const fn new() -> Self {
+        Self {
+            moves: Deque::new(),
+            interval: 0,
+            count: 0,
+            add: 0,
+            next_step_clock: 0,
+            position: 0,
+            direction: 1,
+            step_width: 1,
+            enabled: false,
+        }
+    }
+
+    /// Set step width (TMC4671 position units per Klipper step).
+    pub fn set_step_width(&mut self, width: i32) {
+        self.step_width = width;
+    }
+
+    /// Set direction for subsequent steps.
+    ///
+    /// - `forward = true`: steps increment position
+    /// - `forward = false`: steps decrement position
+    pub fn set_direction(&mut self, forward: bool) {
+        self.direction = if forward { 1 } else { -1 };
+    }
+
+    /// Reset the step clock reference to `clock`.
+    ///
+    /// The next step in any subsequently loaded segment will be scheduled
+    /// relative to this value.
+    pub fn reset_clock(&mut self, clock: u32) {
+        self.next_step_clock = clock;
+    }
+
+    /// Enqueue a move segment.
+    ///
+    /// Returns `Err(m)` if the queue is full (capacity 1024).
+    pub fn queue_move(&mut self, m: StepMove) -> Result<(), StepMove> {
+        self.moves.push_back(m).map_err(|_| m)
+    }
+
+    /// Get current position in raw step counts.
+    pub fn position(&self) -> i32 {
+        self.position
+    }
+
+    /// Get current position scaled to TMC4671 units.
+    ///
+    /// Returns `position * step_width`, using wrapping multiplication.
+    pub fn position_target(&self) -> i32 {
+        self.position.wrapping_mul(self.step_width)
+    }
+
+    /// Advance the stepper up to the given clock time.
+    ///
+    /// Processes queued moves, accumulating position for each step whose
+    /// scheduled time has passed. Clock comparisons use signed 32-bit
+    /// arithmetic to handle wraparound correctly.
+    ///
+    /// Returns `true` if any steps were taken.
+    pub fn advance(&mut self, now: u32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        let mut stepped = false;
+
+        loop {
+            // If the current segment is exhausted, load the next one.
+            if self.count == 0 {
+                match self.moves.pop_front() {
+                    Some(m) => {
+                        self.interval = m.interval;
+                        self.count = m.count;
+                        self.add = m.add;
+                        if self.count == 0 {
+                            continue;
+                        }
+                        self.next_step_clock = self.next_step_clock.wrapping_add(self.interval);
+                    }
+                    None => break,
+                }
+            }
+
+            // Check if the next step time has passed (signed wraparound comparison).
+            let diff = (now as i32).wrapping_sub(self.next_step_clock as i32);
+            if diff < 0 {
+                break; // Next step is in the future.
+            }
+
+            // Execute one step.
+            self.position = self.position.wrapping_add(self.direction);
+            self.count -= 1;
+            stepped = true;
+
+            if self.count > 0 {
+                self.interval = (self.interval as i32 + self.add as i32) as u32;
+                self.next_step_clock = self.next_step_clock.wrapping_add(self.interval);
+            }
+        }
+
+        stepped
+    }
+
+    /// Enable or disable the stepper.
+    ///
+    /// A disabled stepper ignores all `advance` calls.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Returns `true` if the stepper is currently enabled.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Stop all motion and clear the move queue.
+    ///
+    /// The accumulated position is preserved. Any in-flight segment and all
+    /// queued segments are discarded.
+    pub fn stop(&mut self) {
+        self.count = 0;
+        self.interval = 0;
+        self.add = 0;
+        while self.moves.pop_front().is_some() {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn constant_velocity_steps() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+        s.set_step_width(10);
+
+        s.queue_move(StepMove {
+            interval: 100,
+            count: 5,
+            add: 0,
+        })
+        .unwrap();
+        s.advance(550);
+        assert_eq!(s.position(), 5);
+        assert_eq!(s.position_target(), 50);
+    }
+
+    #[test]
+    fn direction_change() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+
+        s.queue_move(StepMove {
+            interval: 10,
+            count: 3,
+            add: 0,
+        })
+        .unwrap();
+        s.advance(100);
+        assert_eq!(s.position(), 3);
+
+        s.set_direction(false);
+        s.queue_move(StepMove {
+            interval: 10,
+            count: 2,
+            add: 0,
+        })
+        .unwrap();
+        s.advance(200);
+        assert_eq!(s.position(), 1);
+    }
+
+    #[test]
+    fn accelerating_steps() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+
+        // 3 steps: intervals 100, 80, 60 (add = -20)
+        s.queue_move(StepMove {
+            interval: 100,
+            count: 3,
+            add: -20,
+        })
+        .unwrap();
+
+        assert!(!s.advance(99));
+        assert!(s.advance(100));
+        assert_eq!(s.position(), 1);
+
+        assert!(s.advance(180));
+        assert_eq!(s.position(), 2);
+
+        assert!(s.advance(240));
+        assert_eq!(s.position(), 3);
+    }
+
+    #[test]
+    fn disabled_stepper_does_not_advance() {
+        let mut s = EmulatedStepper::new();
+        s.reset_clock(0);
+        s.queue_move(StepMove {
+            interval: 10,
+            count: 5,
+            add: 0,
+        })
+        .unwrap();
+
+        s.advance(100);
+        assert_eq!(s.position(), 0);
+    }
+
+    #[test]
+    fn queue_overflow_returns_error() {
+        let mut s = EmulatedStepper::new();
+        for _ in 0..1024 {
+            s.queue_move(StepMove {
+                interval: 10,
+                count: 1,
+                add: 0,
+            })
+            .unwrap();
+        }
+        let result = s.queue_move(StepMove {
+            interval: 10,
+            count: 1,
+            add: 0,
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn stop_clears_queue() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+        s.queue_move(StepMove {
+            interval: 10,
+            count: 100,
+            add: 0,
+        })
+        .unwrap();
+
+        s.advance(50);
+        let pos = s.position();
+        assert!(pos > 0);
+
+        s.stop();
+        s.advance(10000);
+        assert_eq!(s.position(), pos);
+    }
+
+    #[test]
+    fn multiple_segments() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+
+        // Two segments back to back.
+        s.queue_move(StepMove {
+            interval: 100,
+            count: 3,
+            add: 0,
+        })
+        .unwrap();
+        s.queue_move(StepMove {
+            interval: 50,
+            count: 2,
+            add: 0,
+        })
+        .unwrap();
+
+        s.advance(1000);
+        assert_eq!(s.position(), 5);
+    }
+
+    #[test]
+    fn clock_wraparound() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0xFFFF_FF00);
+
+        s.queue_move(StepMove {
+            interval: 100,
+            count: 3,
+            add: 0,
+        })
+        .unwrap();
+
+        // Steps at 0xFFFFFF64, 0x28, 0x8C (wrapping around)
+        s.advance(0x0000_0100);
+        assert_eq!(s.position(), 3);
+    }
+}
