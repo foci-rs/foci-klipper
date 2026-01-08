@@ -63,6 +63,12 @@ impl State {
     }
 }
 
+impl anchor::ShutdownState for State {
+    fn is_shutdown(&self) -> bool {
+        self.mcu_state.is_shutdown()
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         Self::new()
