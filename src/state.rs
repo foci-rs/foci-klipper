@@ -132,4 +132,28 @@ mod tests {
         assert_eq!(a.mcu_state, b.mcu_state);
         assert_eq!(a.config_crc, b.config_crc);
     }
+
+    #[test]
+    fn shutdown_state_configuring() {
+        use anchor::ShutdownState;
+        let state = State::new();
+        assert!(!state.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_state_running() {
+        use anchor::ShutdownState;
+        let mut state = State::new();
+        state.mcu_state = McuState::Running;
+        assert!(!state.is_shutdown());
+    }
+
+    #[test]
+    fn shutdown_state_shutdown() {
+        use anchor::ShutdownState;
+        let mut state = State::new();
+        state.mcu_state = McuState::Shutdown { reason: 0 };
+        assert!(state.is_shutdown());
+    }
+
 }
