@@ -155,5 +155,4 @@ mod tests {
         state.mcu_state = McuState::Shutdown { reason: 0 };
         assert!(state.is_shutdown());
     }
-
 }

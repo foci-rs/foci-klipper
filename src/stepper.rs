@@ -146,7 +146,9 @@ impl EmulatedStepper {
             stepped = true;
 
             if self.count > 0 {
-                self.interval = (self.interval as i32 + self.add as i32) as u32;
+                self.interval = (self.interval as i32)
+                    .saturating_add(self.add as i32)
+                    .max(1) as u32;
                 self.next_step_clock = self.next_step_clock.wrapping_add(self.interval);
             }
         }
@@ -283,6 +285,25 @@ mod tests {
             add: 0,
         });
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn interval_underflow_clamps_to_one() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+
+        // interval=50, add=-100: without clamp, wraps to u32::MAX
+        s.queue_move(StepMove {
+            interval: 50,
+            count: 3,
+            add: -100,
+        })
+        .unwrap();
+
+        // Should complete all 3 steps quickly, not stall for ~25s
+        s.advance(200);
+        assert_eq!(s.position(), 3);
     }
 
     #[test]
