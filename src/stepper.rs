@@ -178,6 +178,11 @@ impl EmulatedStepper {
         self.add = 0;
         while self.moves.pop_front().is_some() {}
     }
+
+    /// Returns true if the move queue is empty and no segment is in progress.
+    pub fn move_queue_empty(&self) -> bool {
+        self.moves.is_empty() && self.count == 0
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +330,96 @@ mod tests {
         s.stop();
         s.advance(10000);
         assert_eq!(s.position(), pos);
+    }
+
+    #[test]
+    fn stop_preserves_position() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+        s.queue_move(StepMove {
+            interval: 10,
+            count: 5,
+            add: 0,
+        })
+        .unwrap();
+
+        s.advance(50);
+        let pos = s.position();
+        assert_eq!(pos, 5);
+
+        s.stop();
+        assert_eq!(s.position(), 5, "stop() must preserve accumulated position");
+    }
+
+    #[test]
+    fn stop_reports_queue_empty() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+        s.queue_move(StepMove {
+            interval: 10,
+            count: 100,
+            add: 0,
+        })
+        .unwrap();
+        s.queue_move(StepMove {
+            interval: 5,
+            count: 50,
+            add: 0,
+        })
+        .unwrap();
+
+        // Advance partway through the first segment so count > 0.
+        s.advance(50);
+        assert!(!s.move_queue_empty(), "queue must not be empty mid-motion");
+
+        s.stop();
+        assert!(
+            s.move_queue_empty(),
+            "move_queue_empty() must be true after stop()"
+        );
+    }
+
+    #[test]
+    fn stop_on_idle_stepper_is_noop() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+
+        // stop() on an already-idle stepper must not panic or corrupt state.
+        s.stop();
+        assert_eq!(s.position(), 0);
+        assert!(s.move_queue_empty());
+    }
+
+    #[test]
+    fn move_queue_empty_false_when_moves_queued() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+
+        assert!(s.move_queue_empty(), "fresh stepper queue must be empty");
+
+        s.queue_move(StepMove {
+            interval: 100,
+            count: 10,
+            add: 0,
+        })
+        .unwrap();
+
+        assert!(
+            !s.move_queue_empty(),
+            "queue must not be empty after queue_move"
+        );
+    }
+
+    #[test]
+    fn move_queue_empty_true_on_fresh_stepper() {
+        let s = EmulatedStepper::new();
+        assert!(
+            s.move_queue_empty(),
+            "fresh stepper must report queue empty"
+        );
     }
 
     #[test]
