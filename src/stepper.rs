@@ -14,6 +14,24 @@ pub struct StepMove {
     pub count: u16,
     /// Interval change per step (acceleration).
     pub add: i16,
+    /// Whether direction changed relative to the previous move.
+    /// Set by `queue_move` when `last_dir != next_dir` (matches
+    /// Klipper's `MF_DIR` flag). When true, `advance()` negates
+    /// the stepper's direction on segment load.
+    dir_changed: bool,
+}
+
+impl StepMove {
+    /// Create a new move segment. The `dir_changed` flag is set
+    /// automatically by `EmulatedStepper::queue_move`.
+    pub const fn new(interval: u32, count: u16, add: i16) -> Self {
+        Self {
+            interval,
+            count,
+            add,
+            dir_changed: false,
+        }
+    }
 }
 
 /// Emulates a stepper motor for Klipper.
@@ -35,6 +53,11 @@ pub struct EmulatedStepper {
     position: i32,
     /// Current direction: 1 for forward, -1 for backward.
     direction: i32,
+    /// Direction of the most recently queued move (Klipper `SF_LAST_DIR`).
+    last_dir: bool,
+    /// Direction set by `set_direction` for the next queued move
+    /// (Klipper `SF_NEXT_DIR`).
+    next_dir: bool,
     /// Step width in TMC4671 position units per step.
     step_width: i32,
     /// Whether the stepper is enabled.
@@ -58,6 +81,8 @@ impl EmulatedStepper {
             next_step_clock: 0,
             position: 0,
             direction: 1,
+            last_dir: true,
+            next_dir: true,
             step_width: 1,
             enabled: false,
         }
@@ -68,12 +93,12 @@ impl EmulatedStepper {
         self.step_width = width;
     }
 
-    /// Set direction for subsequent steps.
+    /// Set direction for subsequently queued moves.
     ///
-    /// - `forward = true`: steps increment position
-    /// - `forward = false`: steps decrement position
+    /// The direction is captured into each `StepMove` at queue time.
+    /// Matches Klipper's `set_next_step_dir` command.
     pub fn set_direction(&mut self, forward: bool) {
-        self.direction = if forward { 1 } else { -1 };
+        self.next_dir = forward;
     }
 
     /// Reset the step clock reference to `clock`.
@@ -86,8 +111,17 @@ impl EmulatedStepper {
 
     /// Enqueue a move segment.
     ///
+    /// Captures the current direction state: if `next_dir` differs from
+    /// `last_dir`, the move is flagged with `dir_changed` and `last_dir`
+    /// is updated. Matches Klipper's `command_queue_step` logic.
+    ///
     /// Returns `Err(m)` if the queue is full (capacity 1024).
     pub fn queue_move(&mut self, m: StepMove) -> Result<(), StepMove> {
+        let dir_changed = self.last_dir != self.next_dir;
+        if dir_changed {
+            self.last_dir = self.next_dir;
+        }
+        let m = StepMove { dir_changed, ..m };
         self.moves.push_back(m).map_err(|_| m)
     }
 
@@ -125,6 +159,9 @@ impl EmulatedStepper {
                         self.interval = m.interval;
                         self.count = m.count;
                         self.add = m.add;
+                        if m.dir_changed {
+                            self.direction = -self.direction;
+                        }
                         if self.count == 0 {
                             continue;
                         }
@@ -168,6 +205,15 @@ impl EmulatedStepper {
         self.enabled
     }
 
+    /// Reset position to zero, stop all motion, and clear the move queue.
+    ///
+    /// Used when the hardware position reference is zeroed (e.g. during
+    /// calibration or motor disable) so the stepper accumulator matches.
+    pub fn reset_position(&mut self) {
+        self.position = 0;
+        self.stop();
+    }
+
     /// Stop all motion and clear the move queue.
     ///
     /// The accumulated position is preserved. Any in-flight segment and all
@@ -196,12 +242,7 @@ mod tests {
         s.reset_clock(0);
         s.set_step_width(10);
 
-        s.queue_move(StepMove {
-            interval: 100,
-            count: 5,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(100, 5, 0)).unwrap();
         s.advance(550);
         assert_eq!(s.position(), 5);
         assert_eq!(s.position_target(), 50);
@@ -213,22 +254,12 @@ mod tests {
         s.set_enabled(true);
         s.reset_clock(0);
 
-        s.queue_move(StepMove {
-            interval: 10,
-            count: 3,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(10, 3, 0)).unwrap();
         s.advance(100);
         assert_eq!(s.position(), 3);
 
         s.set_direction(false);
-        s.queue_move(StepMove {
-            interval: 10,
-            count: 2,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(10, 2, 0)).unwrap();
         s.advance(200);
         assert_eq!(s.position(), 1);
     }
@@ -240,12 +271,7 @@ mod tests {
         s.reset_clock(0);
 
         // 3 steps: intervals 100, 80, 60 (add = -20)
-        s.queue_move(StepMove {
-            interval: 100,
-            count: 3,
-            add: -20,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(100, 3, -20)).unwrap();
 
         assert!(!s.advance(99));
         assert!(s.advance(100));
@@ -262,12 +288,7 @@ mod tests {
     fn disabled_stepper_does_not_advance() {
         let mut s = EmulatedStepper::new();
         s.reset_clock(0);
-        s.queue_move(StepMove {
-            interval: 10,
-            count: 5,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(10, 5, 0)).unwrap();
 
         s.advance(100);
         assert_eq!(s.position(), 0);
@@ -277,18 +298,9 @@ mod tests {
     fn queue_overflow_returns_error() {
         let mut s = EmulatedStepper::new();
         for _ in 0..1024 {
-            s.queue_move(StepMove {
-                interval: 10,
-                count: 1,
-                add: 0,
-            })
-            .unwrap();
+            s.queue_move(StepMove::new(10, 1, 0)).unwrap();
         }
-        let result = s.queue_move(StepMove {
-            interval: 10,
-            count: 1,
-            add: 0,
-        });
+        let result = s.queue_move(StepMove::new(10, 1, 0));
         assert!(result.is_err());
     }
 
@@ -299,12 +311,7 @@ mod tests {
         s.reset_clock(0);
 
         // interval=50, add=-100: without clamp, wraps to u32::MAX
-        s.queue_move(StepMove {
-            interval: 50,
-            count: 3,
-            add: -100,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(50, 3, -100)).unwrap();
 
         // Should complete all 3 steps quickly, not stall for ~25s
         s.advance(200);
@@ -316,12 +323,7 @@ mod tests {
         let mut s = EmulatedStepper::new();
         s.set_enabled(true);
         s.reset_clock(0);
-        s.queue_move(StepMove {
-            interval: 10,
-            count: 100,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(10, 100, 0)).unwrap();
 
         s.advance(50);
         let pos = s.position();
@@ -337,12 +339,7 @@ mod tests {
         let mut s = EmulatedStepper::new();
         s.set_enabled(true);
         s.reset_clock(0);
-        s.queue_move(StepMove {
-            interval: 10,
-            count: 5,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(10, 5, 0)).unwrap();
 
         s.advance(50);
         let pos = s.position();
@@ -357,18 +354,8 @@ mod tests {
         let mut s = EmulatedStepper::new();
         s.set_enabled(true);
         s.reset_clock(0);
-        s.queue_move(StepMove {
-            interval: 10,
-            count: 100,
-            add: 0,
-        })
-        .unwrap();
-        s.queue_move(StepMove {
-            interval: 5,
-            count: 50,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(10, 100, 0)).unwrap();
+        s.queue_move(StepMove::new(5, 50, 0)).unwrap();
 
         // Advance partway through the first segment so count > 0.
         s.advance(50);
@@ -379,6 +366,28 @@ mod tests {
             s.move_queue_empty(),
             "move_queue_empty() must be true after stop()"
         );
+    }
+
+    #[test]
+    fn reset_position_zeros_and_clears_queue() {
+        let mut s = EmulatedStepper::new();
+        s.set_enabled(true);
+        s.reset_clock(0);
+        s.set_step_width(10);
+
+        s.queue_move(StepMove::new(10, 50, 0)).unwrap();
+        s.queue_move(StepMove::new(10, 50, 0)).unwrap();
+        s.advance(200);
+        assert!(s.position() > 0);
+
+        s.reset_position();
+        assert_eq!(s.position(), 0);
+        assert_eq!(s.position_target(), 0);
+        assert!(s.move_queue_empty());
+
+        // Advance after reset must not move.
+        s.advance(10000);
+        assert_eq!(s.position(), 0);
     }
 
     #[test]
@@ -400,12 +409,7 @@ mod tests {
 
         assert!(s.move_queue_empty(), "fresh stepper queue must be empty");
 
-        s.queue_move(StepMove {
-            interval: 100,
-            count: 10,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(100, 10, 0)).unwrap();
 
         assert!(
             !s.move_queue_empty(),
@@ -429,18 +433,8 @@ mod tests {
         s.reset_clock(0);
 
         // Two segments back to back.
-        s.queue_move(StepMove {
-            interval: 100,
-            count: 3,
-            add: 0,
-        })
-        .unwrap();
-        s.queue_move(StepMove {
-            interval: 50,
-            count: 2,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(100, 3, 0)).unwrap();
+        s.queue_move(StepMove::new(50, 2, 0)).unwrap();
 
         s.advance(1000);
         assert_eq!(s.position(), 5);
@@ -452,12 +446,7 @@ mod tests {
         s.set_enabled(true);
         s.reset_clock(0xFFFF_FF00);
 
-        s.queue_move(StepMove {
-            interval: 100,
-            count: 3,
-            add: 0,
-        })
-        .unwrap();
+        s.queue_move(StepMove::new(100, 3, 0)).unwrap();
 
         // Steps at 0xFFFFFF64, 0x28, 0x8C (wrapping around)
         s.advance(0x0000_0100);
