@@ -93,6 +93,11 @@ impl EmulatedStepper {
         self.step_width = width;
     }
 
+    /// Returns the current step width (TMC4671 position units per Klipper step).
+    pub fn step_width(&self) -> i32 {
+        self.step_width
+    }
+
     /// Set direction for subsequently queued moves.
     ///
     /// The direction is captured into each `StepMove` at queue time.
