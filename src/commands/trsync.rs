@@ -30,35 +30,35 @@ pub fn trsync_start(
     report_clock: u32,
     report_ticks: u32,
     expire_reason: u8,
-) {
+) -> Result<(), CommandError> {
     state
         .stepper_trsync_links
         .retain(|&(_, ts_oid)| ts_oid != oid);
-    if let Some(ts) = state.trsync_mut(oid) {
-        ts.arm(report_clock, report_ticks, expire_reason);
-    }
+    let ts = state.trsync_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
+    ts.arm(report_clock, report_ticks, expire_reason);
+    Ok(())
 }
 
 /// Update the expiry deadline for a TrSync.
-pub fn trsync_set_timeout(state: &mut State, oid: u8, clock: u32) {
-    if let Some(ts) = state.trsync_mut(oid) {
-        ts.set_timeout(clock);
-    }
+pub fn trsync_set_timeout(state: &mut State, oid: u8, clock: u32) -> Result<(), CommandError> {
+    let ts = state.trsync_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
+    ts.set_timeout(clock);
+    Ok(())
 }
 
 /// Manually trigger a TrSync with the given reason code.
 ///
-/// Returns `true` if the trigger was accepted (TrSync was Armed).
-/// When `true`, all steppers linked to this TrSync are stopped.
-pub fn trsync_trigger(state: &mut State, oid: u8, reason: u8) -> bool {
-    let accepted = state
-        .trsync_mut(oid)
-        .map(|ts| ts.trigger(reason))
-        .unwrap_or(false);
+/// Returns `Ok(true)` if the trigger was accepted (TrSync was Armed).
+/// Returns `Ok(false)` if the TrSync exists but was not Armed.
+/// Returns `Err(UnknownOid)` if the OID is not registered.
+/// When accepted, all steppers linked to this TrSync are stopped.
+pub fn trsync_trigger(state: &mut State, oid: u8, reason: u8) -> Result<bool, CommandError> {
+    let ts = state.trsync_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
+    let accepted = ts.trigger(reason);
     if accepted {
         stop_linked_steppers(state, oid);
     }
-    accepted
+    Ok(accepted)
 }
 
 /// Stop all steppers linked to the given TrSync OID.
@@ -100,10 +100,28 @@ mod tests {
     }
 
     #[test]
+    fn trsync_start_unknown_oid() {
+        let mut state = State::new();
+        assert_eq!(
+            trsync_start(&mut state, 99, 1000, 500, 1),
+            Err(CommandError::UnknownOid(99))
+        );
+    }
+
+    #[test]
+    fn trsync_set_timeout_unknown_oid() {
+        let mut state = State::new();
+        assert_eq!(
+            trsync_set_timeout(&mut state, 99, 5000),
+            Err(CommandError::UnknownOid(99))
+        );
+    }
+
+    #[test]
     fn trsync_start_arms() {
         let mut state = State::new();
         config_trsync(&mut state, 10).unwrap();
-        trsync_start(&mut state, 10, 1000, 500, 1);
+        trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
         assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Armed);
     }
 
@@ -115,7 +133,7 @@ mod tests {
         stepper_stop_on_trigger(&mut state, 0, 10).unwrap();
         assert_eq!(state.stepper_trsync_links.len(), 1);
 
-        trsync_start(&mut state, 10, 1000, 500, 1);
+        trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
         assert!(state.stepper_trsync_links.is_empty());
     }
 
@@ -123,8 +141,8 @@ mod tests {
     fn trsync_trigger_accepted() {
         let mut state = State::new();
         config_trsync(&mut state, 10).unwrap();
-        trsync_start(&mut state, 10, 1000, 500, 1);
-        assert!(trsync_trigger(&mut state, 10, 2));
+        trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
+        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(true));
         assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(2));
     }
 
@@ -132,7 +150,7 @@ mod tests {
     fn trsync_trigger_not_armed() {
         let mut state = State::new();
         config_trsync(&mut state, 10).unwrap();
-        assert!(!trsync_trigger(&mut state, 10, 1));
+        assert_eq!(trsync_trigger(&mut state, 10, 1), Ok(false));
     }
 
     #[test]
@@ -144,9 +162,9 @@ mod tests {
         queue_step(&mut state, 0, 1000, 100, 0).unwrap();
         assert!(!state.stepper(0).unwrap().move_queue_empty());
 
-        trsync_start(&mut state, 10, 1000, 500, 1);
+        trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
         stepper_stop_on_trigger(&mut state, 0, 10).unwrap();
-        trsync_trigger(&mut state, 10, 2);
+        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(true));
 
         assert!(state.stepper(0).unwrap().move_queue_empty());
     }
@@ -154,6 +172,9 @@ mod tests {
     #[test]
     fn trsync_trigger_unknown_oid() {
         let mut state = State::new();
-        assert!(!trsync_trigger(&mut state, 99, 1));
+        assert_eq!(
+            trsync_trigger(&mut state, 99, 1),
+            Err(CommandError::UnknownOid(99))
+        );
     }
 }

@@ -42,17 +42,21 @@ pub fn queue_step(
 ///
 /// `dir=0` means negative, `dir=1` means positive (matches Klipper
 /// stepcompress).
-pub fn set_next_step_dir(state: &mut State, oid: u8, dir: u8) {
-    if let Some(stepper) = state.stepper_mut(oid) {
-        stepper.set_direction(dir != 0);
-    }
+pub fn set_next_step_dir(state: &mut State, oid: u8, dir: u8) -> Result<(), CommandError> {
+    let stepper = state
+        .stepper_mut(oid)
+        .ok_or(CommandError::UnknownOid(oid))?;
+    stepper.set_direction(dir != 0);
+    Ok(())
 }
 
 /// Reset the step clock reference for a stepper.
-pub fn reset_step_clock(state: &mut State, oid: u8, clock: u32) {
-    if let Some(stepper) = state.stepper_mut(oid) {
-        stepper.reset_clock(clock);
-    }
+pub fn reset_step_clock(state: &mut State, oid: u8, clock: u32) -> Result<(), CommandError> {
+    let stepper = state
+        .stepper_mut(oid)
+        .ok_or(CommandError::UnknownOid(oid))?;
+    stepper.reset_clock(clock);
+    Ok(())
 }
 
 /// Return the current position of a stepper.
@@ -146,8 +150,25 @@ mod tests {
     fn set_next_step_dir_forward() {
         let mut state = State::new();
         config_stepper(&mut state, 0).unwrap();
-        set_next_step_dir(&mut state, 0, 1);
-        // Direction is consumed on next queue_move; verify no panic.
+        set_next_step_dir(&mut state, 0, 1).unwrap();
+    }
+
+    #[test]
+    fn set_next_step_dir_unknown_oid() {
+        let mut state = State::new();
+        assert_eq!(
+            set_next_step_dir(&mut state, 99, 1),
+            Err(CommandError::UnknownOid(99))
+        );
+    }
+
+    #[test]
+    fn reset_step_clock_unknown_oid() {
+        let mut state = State::new();
+        assert_eq!(
+            reset_step_clock(&mut state, 99, 1000),
+            Err(CommandError::UnknownOid(99))
+        );
     }
 
     #[test]

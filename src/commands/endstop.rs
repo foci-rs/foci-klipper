@@ -42,18 +42,18 @@ pub fn endstop_home(
     pin_value: bool,
     trsync_oid: u8,
     trigger_reason: u8,
-) {
-    if let Some(endstop) = state.endstop_mut(oid) {
-        endstop.start_homing(
-            clock,
-            sample_ticks,
-            sample_count,
-            rest_ticks,
-            pin_value,
-            trsync_oid,
-            trigger_reason,
-        );
-    }
+) -> Result<(), CommandError> {
+    let endstop = state.endstop_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
+    endstop.start_homing(
+        clock,
+        sample_ticks,
+        sample_count,
+        rest_ticks,
+        pin_value,
+        trsync_oid,
+        trigger_reason,
+    );
+    Ok(())
 }
 
 /// Query the state of an endstop.
@@ -91,14 +91,17 @@ mod tests {
     fn endstop_home_arms() {
         let mut state = State::new();
         config_endstop(&mut state, 20).unwrap();
-        endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 10, 1);
+        endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 10, 1).unwrap();
         assert!(state.endstop(20).unwrap().is_homing());
     }
 
     #[test]
-    fn endstop_home_unknown_oid_is_noop() {
+    fn endstop_home_unknown_oid_errors() {
         let mut state = State::new();
-        endstop_home(&mut state, 99, 1000, 500, 3, 100, true, 10, 1);
+        assert_eq!(
+            endstop_home(&mut state, 99, 1000, 500, 3, 100, true, 10, 1),
+            Err(CommandError::UnknownOid(99))
+        );
     }
 
     #[test]
@@ -113,7 +116,7 @@ mod tests {
     fn endstop_query_state_homing() {
         let mut state = State::new();
         config_endstop(&mut state, 20).unwrap();
-        endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 10, 1);
+        endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 10, 1).unwrap();
         let (homing, next_clock) = endstop_query_state(&state, 20);
         assert!(homing);
         assert_eq!(next_clock, 1000);
