@@ -5,6 +5,9 @@ use crate::state::{State, NUM_TRSYNC};
 
 /// Register a TrSync (trigger synchronization) object by OID.
 pub fn config_trsync(state: &mut State, oid: u8) -> Result<(), CommandError> {
+    if state.trsync_by_oid.contains_key(&oid) {
+        return Err(CommandError::DuplicateOid(oid));
+    }
     let idx = state.trsync_by_oid.len();
     if idx >= NUM_TRSYNC {
         return Err(CommandError::SlotsFull);

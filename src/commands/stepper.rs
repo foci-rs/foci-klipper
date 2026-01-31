@@ -9,6 +9,9 @@ use crate::stepper::StepMove;
 /// Pin parameters from the Klipper protocol are accepted by the firmware
 /// wrapper but not passed here — the TMC4671 handles stepping internally.
 pub fn config_stepper(state: &mut State, oid: u8) -> Result<(), CommandError> {
+    if state.steppers_by_oid.contains_key(&oid) {
+        return Err(CommandError::DuplicateOid(oid));
+    }
     let idx = state.steppers_by_oid.len();
     if idx >= NUM_STEPPERS {
         return Err(CommandError::SlotsFull);
@@ -96,6 +99,16 @@ mod tests {
         assert!(config_stepper(&mut state, 10).is_ok());
         assert!(state.stepper(5).is_some());
         assert!(state.stepper(10).is_some());
+    }
+
+    #[test]
+    fn config_stepper_duplicate_oid() {
+        let mut state = State::new();
+        assert!(config_stepper(&mut state, 5).is_ok());
+        assert_eq!(
+            config_stepper(&mut state, 5),
+            Err(CommandError::DuplicateOid(5))
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub mod trsync;
 pub enum CommandError {
     /// OID not found in lookup map.
     UnknownOid(u8),
+    /// OID already registered (duplicate config command).
+    DuplicateOid(u8),
     /// No slots available for new object registration.
     SlotsFull,
     /// Move queue overflow.

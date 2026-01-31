@@ -12,6 +12,9 @@ use crate::state::{State, NUM_ENDSTOPS};
 /// (board-specific PAC register access). This function only registers
 /// the OID mapping.
 pub fn config_endstop(state: &mut State, oid: u8) -> Result<(), CommandError> {
+    if state.endstop_by_oid.contains_key(&oid) {
+        return Err(CommandError::DuplicateOid(oid));
+    }
     let idx = state.endstop_by_oid.len();
     if idx >= NUM_ENDSTOPS {
         return Err(CommandError::SlotsFull);

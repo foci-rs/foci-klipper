@@ -8,6 +8,9 @@ use crate::state::{State, NUM_STEPPERS};
 /// Pin parameters are accepted by the firmware wrapper for protocol
 /// compatibility but not passed here.
 pub fn config_digital_out(state: &mut State, oid: u8) -> Result<(), CommandError> {
+    if state.enable_by_oid.contains_key(&oid) {
+        return Err(CommandError::DuplicateOid(oid));
+    }
     let idx = state.enable_by_oid.len();
     if idx >= NUM_STEPPERS {
         return Err(CommandError::SlotsFull);
