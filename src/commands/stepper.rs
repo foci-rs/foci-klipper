@@ -75,6 +75,12 @@ pub fn stepper_stop_on_trigger(
     oid: u8,
     trsync_oid: u8,
 ) -> Result<(), CommandError> {
+    if !state.steppers_by_oid.contains_key(&oid) {
+        return Err(CommandError::UnknownOid(oid));
+    }
+    if !state.trsync_by_oid.contains_key(&trsync_oid) {
+        return Err(CommandError::UnknownOid(trsync_oid));
+    }
     state
         .stepper_trsync_links
         .push((oid, trsync_oid))
@@ -152,23 +158,53 @@ mod tests {
 
     #[test]
     fn stepper_stop_on_trigger_success() {
+        use crate::commands::trsync::config_trsync;
         let mut state = State::new();
         config_stepper(&mut state, 0).unwrap();
+        config_trsync(&mut state, 10).unwrap();
         assert!(stepper_stop_on_trigger(&mut state, 0, 10).is_ok());
         assert_eq!(state.stepper_trsync_links.len(), 1);
         assert_eq!(state.stepper_trsync_links[0], (0, 10));
     }
 
     #[test]
-    fn stepper_stop_on_trigger_link_table_full() {
+    fn stepper_stop_on_trigger_unknown_stepper() {
+        use crate::commands::trsync::config_trsync;
+        let mut state = State::new();
+        config_trsync(&mut state, 10).unwrap();
+        assert_eq!(
+            stepper_stop_on_trigger(&mut state, 99, 10),
+            Err(CommandError::UnknownOid(99))
+        );
+    }
+
+    #[test]
+    fn stepper_stop_on_trigger_unknown_trsync() {
         let mut state = State::new();
         config_stepper(&mut state, 0).unwrap();
-        // Fill the link table (capacity 8)
-        for i in 0..8u8 {
-            stepper_stop_on_trigger(&mut state, 0, i).unwrap();
-        }
         assert_eq!(
             stepper_stop_on_trigger(&mut state, 0, 99),
+            Err(CommandError::UnknownOid(99))
+        );
+    }
+
+    #[test]
+    fn stepper_stop_on_trigger_link_table_full() {
+        use crate::commands::trsync::config_trsync;
+        let mut state = State::new();
+        config_stepper(&mut state, 0).unwrap();
+        config_stepper(&mut state, 1).unwrap();
+        config_trsync(&mut state, 10).unwrap();
+        config_trsync(&mut state, 11).unwrap();
+        config_trsync(&mut state, 12).unwrap();
+        config_trsync(&mut state, 13).unwrap();
+        // Fill the link table (capacity 8) with valid OID combinations
+        for trsync in 10..14u8 {
+            stepper_stop_on_trigger(&mut state, 0, trsync).unwrap();
+            stepper_stop_on_trigger(&mut state, 1, trsync).unwrap();
+        }
+        assert_eq!(
+            stepper_stop_on_trigger(&mut state, 0, 10),
             Err(CommandError::SlotsFull)
         );
     }
