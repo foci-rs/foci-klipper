@@ -43,7 +43,12 @@ pub fn endstop_home(
     trsync_oid: u8,
     trigger_reason: u8,
 ) -> Result<(), CommandError> {
-    let endstop = state.endstop_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
+    if !state.trsync_by_oid.contains_key(&trsync_oid) {
+        return Err(CommandError::UnknownOid(trsync_oid));
+    }
+    let endstop = state
+        .endstop_mut(oid)
+        .ok_or(CommandError::UnknownOid(oid))?;
     endstop.start_homing(
         clock,
         sample_ticks,
@@ -60,11 +65,9 @@ pub fn endstop_home(
 ///
 /// Returns `(homing, next_clock)`. The firmware wrapper adds the live
 /// GPIO pin state for the full reply.
-pub fn endstop_query_state(state: &State, oid: u8) -> (bool, u32) {
-    state
-        .endstop(oid)
-        .map(|e| e.query_state())
-        .unwrap_or((false, 0))
+pub fn endstop_query_state(state: &State, oid: u8) -> Result<(bool, u32), CommandError> {
+    let endstop = state.endstop(oid).ok_or(CommandError::UnknownOid(oid))?;
+    Ok(endstop.query_state())
 }
 
 #[cfg(test)]
@@ -89,17 +92,31 @@ mod tests {
 
     #[test]
     fn endstop_home_arms() {
+        use crate::commands::trsync::config_trsync;
         let mut state = State::new();
         config_endstop(&mut state, 20).unwrap();
+        config_trsync(&mut state, 10).unwrap();
         endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 10, 1).unwrap();
         assert!(state.endstop(20).unwrap().is_homing());
     }
 
     #[test]
-    fn endstop_home_unknown_oid_errors() {
+    fn endstop_home_unknown_endstop_oid() {
+        use crate::commands::trsync::config_trsync;
         let mut state = State::new();
+        config_trsync(&mut state, 10).unwrap();
         assert_eq!(
             endstop_home(&mut state, 99, 1000, 500, 3, 100, true, 10, 1),
+            Err(CommandError::UnknownOid(99))
+        );
+    }
+
+    #[test]
+    fn endstop_home_unknown_trsync_oid() {
+        let mut state = State::new();
+        config_endstop(&mut state, 20).unwrap();
+        assert_eq!(
+            endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 99, 1),
             Err(CommandError::UnknownOid(99))
         );
     }
@@ -108,16 +125,18 @@ mod tests {
     fn endstop_query_state_not_homing() {
         let mut state = State::new();
         config_endstop(&mut state, 20).unwrap();
-        let (homing, _) = endstop_query_state(&state, 20);
+        let (homing, _) = endstop_query_state(&state, 20).unwrap();
         assert!(!homing);
     }
 
     #[test]
     fn endstop_query_state_homing() {
+        use crate::commands::trsync::config_trsync;
         let mut state = State::new();
         config_endstop(&mut state, 20).unwrap();
+        config_trsync(&mut state, 10).unwrap();
         endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 10, 1).unwrap();
-        let (homing, next_clock) = endstop_query_state(&state, 20);
+        let (homing, next_clock) = endstop_query_state(&state, 20).unwrap();
         assert!(homing);
         assert_eq!(next_clock, 1000);
     }
@@ -125,8 +144,9 @@ mod tests {
     #[test]
     fn endstop_query_state_unknown_oid() {
         let state = State::new();
-        let (homing, next_clock) = endstop_query_state(&state, 99);
-        assert!(!homing);
-        assert_eq!(next_clock, 0);
+        assert_eq!(
+            endstop_query_state(&state, 99),
+            Err(CommandError::UnknownOid(99))
+        );
     }
 }
