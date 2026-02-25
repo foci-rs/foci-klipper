@@ -664,6 +664,11 @@ impl HardwareStepper {
         Ok(now.wrapping_add(2))
     }
 
+    /// Returns the next scheduled step clock.
+    pub fn next_step_clock(&self) -> u32 {
+        self.next_step_clock
+    }
+
     /// Returns the current DIR state.
     pub fn dir_state(&self) -> bool {
         self.dir_state
