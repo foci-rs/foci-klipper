@@ -22,6 +22,10 @@ pub enum CommandError {
     SlotsFull,
     /// Move queue overflow.
     QueueFull,
+    /// Stepper is active (timer armed) when reset attempted.
+    StepperActive,
+    /// Zero-count move rejected.
+    ZeroCount,
 }
 
 /// Returned by [`lifecycle::clear_shutdown`] when called outside shutdown state.
