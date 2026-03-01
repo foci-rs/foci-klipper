@@ -2,7 +2,6 @@
 
 use crate::commands::CommandError;
 use crate::state::{State, NUM_STEPPERS};
-use crate::stepper::StepMove;
 
 /// Register a stepper motor object by OID.
 ///
@@ -21,55 +20,6 @@ pub fn config_stepper(state: &mut State, oid: u8) -> Result<(), CommandError> {
         .insert(oid, idx)
         .map_err(|_| CommandError::SlotsFull)?;
     Ok(())
-}
-
-/// Enqueue a trapezoidal move segment for a stepper.
-pub fn queue_step(
-    state: &mut State,
-    oid: u8,
-    interval: u32,
-    count: u16,
-    add: i16,
-) -> Result<(), CommandError> {
-    let stepper = state
-        .stepper_mut(oid)
-        .ok_or(CommandError::UnknownOid(oid))?;
-    let m = StepMove::new(interval, count, add);
-    stepper.queue_move(m).map_err(|_| CommandError::QueueFull)
-}
-
-/// Set the direction for subsequent steps on a stepper.
-///
-/// `dir=0` means negative, `dir=1` means positive (matches Klipper
-/// stepcompress).
-pub fn set_next_step_dir(state: &mut State, oid: u8, dir: u8) -> Result<(), CommandError> {
-    let stepper = state
-        .stepper_mut(oid)
-        .ok_or(CommandError::UnknownOid(oid))?;
-    stepper.set_direction(dir != 0);
-    Ok(())
-}
-
-/// Reset the step clock reference for a stepper.
-pub fn reset_step_clock(state: &mut State, oid: u8, clock: u32) -> Result<(), CommandError> {
-    let stepper = state
-        .stepper_mut(oid)
-        .ok_or(CommandError::UnknownOid(oid))?;
-    stepper.reset_clock(clock);
-    Ok(())
-}
-
-/// Return the current position of a stepper.
-pub fn stepper_get_position(state: &State, oid: u8) -> i32 {
-    state.stepper(oid).map(|s| s.position()).unwrap_or(0)
-}
-
-/// Return the commanded (target) position of a stepper.
-///
-/// For TMC4671 mode this is equivalent to `stepper_get_position` since
-/// we track only the logical step count.
-pub fn stepper_get_commanded_position(state: &State, oid: u8) -> i32 {
-    state.stepper(oid).map(|s| s.position()).unwrap_or(0)
 }
 
 /// Link a stepper to a TrSync so the stepper stops when the TrSync
@@ -153,7 +103,7 @@ mod tests {
     fn config_stepper_success() {
         let mut state = State::new();
         assert!(config_stepper(&mut state, 0).is_ok());
-        assert!(state.stepper(0).is_some());
+        assert!(state.steppers_by_oid.contains_key(&0));
     }
 
     #[test]
@@ -161,8 +111,8 @@ mod tests {
         let mut state = State::new();
         assert!(config_stepper(&mut state, 5).is_ok());
         assert!(config_stepper(&mut state, 10).is_ok());
-        assert!(state.stepper(5).is_some());
-        assert!(state.stepper(10).is_some());
+        assert!(state.steppers_by_oid.contains_key(&5));
+        assert!(state.steppers_by_oid.contains_key(&10));
     }
 
     #[test]
@@ -182,53 +132,6 @@ mod tests {
             assert!(config_stepper(&mut state, i).is_ok());
         }
         assert_eq!(config_stepper(&mut state, 99), Err(CommandError::SlotsFull));
-    }
-
-    #[test]
-    fn queue_step_unknown_oid() {
-        let mut state = State::new();
-        assert_eq!(
-            queue_step(&mut state, 42, 1000, 10, 0),
-            Err(CommandError::UnknownOid(42))
-        );
-    }
-
-    #[test]
-    fn queue_step_success() {
-        let mut state = State::new();
-        config_stepper(&mut state, 0).unwrap();
-        assert!(queue_step(&mut state, 0, 1000, 10, 0).is_ok());
-    }
-
-    #[test]
-    fn set_next_step_dir_forward() {
-        let mut state = State::new();
-        config_stepper(&mut state, 0).unwrap();
-        set_next_step_dir(&mut state, 0, 1).unwrap();
-    }
-
-    #[test]
-    fn set_next_step_dir_unknown_oid() {
-        let mut state = State::new();
-        assert_eq!(
-            set_next_step_dir(&mut state, 99, 1),
-            Err(CommandError::UnknownOid(99))
-        );
-    }
-
-    #[test]
-    fn reset_step_clock_unknown_oid() {
-        let mut state = State::new();
-        assert_eq!(
-            reset_step_clock(&mut state, 99, 1000),
-            Err(CommandError::UnknownOid(99))
-        );
-    }
-
-    #[test]
-    fn stepper_get_position_unknown_oid() {
-        let state = State::new();
-        assert_eq!(stepper_get_position(&state, 99), 0);
     }
 
     #[test]

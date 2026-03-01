@@ -63,24 +63,15 @@ pub fn trsync_trigger(state: &mut State, oid: u8, reason: u8) -> Result<bool, Co
 
 /// Stop all steppers linked to the given TrSync OID.
 ///
-/// Iterates `stepper_trsync_links` and calls `stop()` on each stepper
-/// whose entry matches `trsync_oid`. Uses index-based iteration for
-/// split borrows.
-fn stop_linked_steppers(state: &mut State, trsync_oid: u8) {
-    for i in 0..state.stepper_trsync_links.len() {
-        let (stepper_oid, linked_trsync) = state.stepper_trsync_links[i];
-        if linked_trsync == trsync_oid {
-            if let Some(&s_idx) = state.steppers_by_oid.get(&stepper_oid) {
-                state.steppers[s_idx].stop();
-            }
-        }
-    }
-}
+/// No-op in the library crate. The board crate handles hardware stepper
+/// stopping directly via `stepper_stop()` and the `STEPPER_NEED_RESET`
+/// atomic when a TrSync fires.
+fn stop_linked_steppers(_state: &mut State, _trsync_oid: u8) {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::stepper::{config_stepper, queue_step, stepper_stop_on_trigger};
+    use crate::commands::stepper::{config_stepper, stepper_stop_on_trigger};
     use crate::trsync::TrSyncState;
 
     #[test]
@@ -154,19 +145,15 @@ mod tests {
     }
 
     #[test]
-    fn trsync_trigger_stops_linked_steppers() {
+    fn trsync_trigger_with_linked_stepper() {
         let mut state = State::new();
         config_stepper(&mut state, 0).unwrap();
         config_trsync(&mut state, 10).unwrap();
 
-        queue_step(&mut state, 0, 1000, 100, 0).unwrap();
-        assert!(!state.stepper(0).unwrap().move_queue_empty());
-
         trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
         stepper_stop_on_trigger(&mut state, 0, 10).unwrap();
         assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(true));
-
-        assert!(state.stepper(0).unwrap().move_queue_empty());
+        assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(2));
     }
 
     #[test]

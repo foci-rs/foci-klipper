@@ -2,7 +2,6 @@
 
 use crate::endstop::Endstop;
 use crate::shutdown::McuState;
-use crate::stepper::EmulatedStepper;
 use crate::trsync::TrSync;
 use heapless::LinearMap;
 
@@ -16,14 +15,14 @@ pub const NUM_ENDSTOPS: usize = 4;
 /// MCU application state.
 ///
 /// Contains all objects managed by the Klipper protocol:
-/// steppers, digital outputs, endstops, TrSync instances, and configuration state.
+/// digital outputs, endstops, TrSync instances, and configuration state.
+/// Stepper scheduling is handled by the board crate via lock-free statics
+/// and a hardware timer ISR.
 pub struct State {
     /// Current MCU lifecycle state.
     pub mcu_state: McuState,
     /// Configuration CRC from finalize_config.
     pub config_crc: Option<u32>,
-    /// Stepper motor objects.
-    pub steppers: [EmulatedStepper; NUM_STEPPERS],
     /// Map from Klipper OID to stepper array index.
     pub steppers_by_oid: LinearMap<u8, usize, NUM_STEPPERS>,
     /// Map from digital output OID to stepper array index (for enable/disable).
@@ -48,7 +47,6 @@ impl State {
         Self {
             mcu_state: McuState::Configuring,
             config_crc: None,
-            steppers: core::array::from_fn(|_| EmulatedStepper::new()),
             steppers_by_oid: LinearMap::new(),
             enable_by_oid: LinearMap::new(),
             trsync: core::array::from_fn(|_| TrSync::new()),
@@ -57,21 +55,6 @@ impl State {
             endstop_by_oid: LinearMap::new(),
             stepper_trsync_links: heapless::Vec::new(),
         }
-    }
-
-    /// Look up a stepper by OID.
-    pub fn stepper(&self, oid: u8) -> Option<&EmulatedStepper> {
-        self.steppers_by_oid
-            .get(&oid)
-            .map(|&idx| &self.steppers[idx])
-    }
-
-    /// Look up a mutable stepper by OID.
-    pub fn stepper_mut(&mut self, oid: u8) -> Option<&mut EmulatedStepper> {
-        self.steppers_by_oid
-            .get(&oid)
-            .copied()
-            .map(move |idx| &mut self.steppers[idx])
     }
 
     /// Look up a TrSync by OID.
@@ -108,9 +91,6 @@ impl State {
         self.config_crc = None;
         self.steppers_by_oid.clear();
         self.enable_by_oid.clear();
-        for s in &mut self.steppers {
-            *s = EmulatedStepper::new();
-        }
         self.trsync_by_oid.clear();
         for t in &mut self.trsync {
             t.reset();
@@ -144,27 +124,6 @@ mod tests {
         let state = State::new();
         assert_eq!(state.mcu_state, McuState::Configuring);
         assert!(state.config_crc.is_none());
-    }
-
-    #[test]
-    fn stepper_oid_lookup() {
-        let mut state = State::new();
-        state.steppers_by_oid.insert(0, 0).unwrap();
-        state.steppers_by_oid.insert(3, 1).unwrap();
-
-        assert!(state.stepper(0).is_some());
-        assert!(state.stepper(3).is_some());
-        assert!(state.stepper(1).is_none());
-    }
-
-    #[test]
-    fn stepper_mut_oid_lookup() {
-        let mut state = State::new();
-        state.steppers_by_oid.insert(5, 0).unwrap();
-
-        let stepper = state.stepper_mut(5).unwrap();
-        stepper.set_enabled(true);
-        assert!(state.steppers[0].enabled());
     }
 
     #[test]
@@ -216,7 +175,6 @@ mod tests {
         state.config_crc = Some(0xDEAD);
         state.steppers_by_oid.insert(0, 0).unwrap();
         state.enable_by_oid.insert(1, 0).unwrap();
-        state.steppers[0].set_enabled(true);
         state.trsync_by_oid.insert(10, 0).unwrap();
         state.trsync[0].arm(1000, 500, 1);
         state.endstop_by_oid.insert(20, 0).unwrap();
@@ -229,7 +187,6 @@ mod tests {
         assert!(state.config_crc.is_none());
         assert!(state.steppers_by_oid.is_empty());
         assert!(state.enable_by_oid.is_empty());
-        assert!(!state.steppers[0].enabled());
         assert!(state.trsync_by_oid.is_empty());
         assert_eq!(state.trsync[0].state(), crate::trsync::TrSyncState::Idle);
         assert!(state.endstop_by_oid.is_empty());

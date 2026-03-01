@@ -27,34 +27,27 @@ pub fn config_digital_out(state: &mut State, oid: u8) -> Result<(), CommandError
 /// Returns `Ok(enabled)` where `enabled` indicates whether the motor
 /// should be turned on (`true`) or off (`false`). The firmware wrapper
 /// sends the hardware enable/disable command based on this value.
-pub fn queue_digital_out(state: &mut State, oid: u8, on_ticks: u32) -> Result<bool, CommandError> {
-    let &idx = state
-        .enable_by_oid
-        .get(&oid)
-        .ok_or(CommandError::UnknownOid(oid))?;
-    let enabled = on_ticks != 0;
-    state.steppers[idx].set_enabled(enabled);
-    Ok(enabled)
+pub fn queue_digital_out(state: &State, oid: u8, on_ticks: u32) -> Result<bool, CommandError> {
+    if !state.enable_by_oid.contains_key(&oid) {
+        return Err(CommandError::UnknownOid(oid));
+    }
+    Ok(on_ticks != 0)
 }
 
 /// Immediately update a digital output value.
 ///
 /// Returns `Ok(enabled)` for the firmware wrapper to send the hardware
 /// enable/disable command.
-pub fn update_digital_out(state: &mut State, oid: u8, value: u8) -> Result<bool, CommandError> {
-    let &idx = state
-        .enable_by_oid
-        .get(&oid)
-        .ok_or(CommandError::UnknownOid(oid))?;
-    let enabled = value != 0;
-    state.steppers[idx].set_enabled(enabled);
-    Ok(enabled)
+pub fn update_digital_out(state: &State, oid: u8, value: u8) -> Result<bool, CommandError> {
+    if !state.enable_by_oid.contains_key(&oid) {
+        return Err(CommandError::UnknownOid(oid));
+    }
+    Ok(value != 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::stepper::config_stepper;
 
     #[test]
     fn config_digital_out_success() {
@@ -77,29 +70,22 @@ mod tests {
     #[test]
     fn queue_digital_out_enable() {
         let mut state = State::new();
-        config_stepper(&mut state, 0).unwrap();
         config_digital_out(&mut state, 10).unwrap();
-        let result = queue_digital_out(&mut state, 10, 1);
-        assert_eq!(result, Ok(true));
-        assert!(state.steppers[0].enabled());
+        assert_eq!(queue_digital_out(&state, 10, 1), Ok(true));
     }
 
     #[test]
     fn queue_digital_out_disable() {
         let mut state = State::new();
-        config_stepper(&mut state, 0).unwrap();
         config_digital_out(&mut state, 10).unwrap();
-        state.steppers[0].set_enabled(true);
-        let result = queue_digital_out(&mut state, 10, 0);
-        assert_eq!(result, Ok(false));
-        assert!(!state.steppers[0].enabled());
+        assert_eq!(queue_digital_out(&state, 10, 0), Ok(false));
     }
 
     #[test]
     fn queue_digital_out_unknown_oid() {
-        let mut state = State::new();
+        let state = State::new();
         assert_eq!(
-            queue_digital_out(&mut state, 99, 1),
+            queue_digital_out(&state, 99, 1),
             Err(CommandError::UnknownOid(99))
         );
     }
@@ -107,17 +93,15 @@ mod tests {
     #[test]
     fn update_digital_out_enable() {
         let mut state = State::new();
-        config_stepper(&mut state, 0).unwrap();
         config_digital_out(&mut state, 10).unwrap();
-        assert_eq!(update_digital_out(&mut state, 10, 1), Ok(true));
-        assert!(state.steppers[0].enabled());
+        assert_eq!(update_digital_out(&state, 10, 1), Ok(true));
     }
 
     #[test]
     fn update_digital_out_unknown_oid() {
-        let mut state = State::new();
+        let state = State::new();
         assert_eq!(
-            update_digital_out(&mut state, 99, 1),
+            update_digital_out(&state, 99, 1),
             Err(CommandError::UnknownOid(99))
         );
     }
