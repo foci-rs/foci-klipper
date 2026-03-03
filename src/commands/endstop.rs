@@ -43,12 +43,15 @@ pub fn endstop_home(
     trsync_oid: u8,
     trigger_reason: u8,
 ) -> Result<(), CommandError> {
-    if !state.trsync_by_oid.contains_key(&trsync_oid) {
+    if !state.endstop_by_oid.contains_key(&oid) {
+        return Err(CommandError::UnknownOid(oid));
+    }
+    // A zero sample_count is a disarm request. It does not arm sampling and
+    // therefore does not require a TrSync to be configured yet.
+    if sample_count != 0 && !state.trsync_by_oid.contains_key(&trsync_oid) {
         return Err(CommandError::UnknownOid(trsync_oid));
     }
-    let endstop = state
-        .endstop_mut(oid)
-        .ok_or(CommandError::UnknownOid(oid))?;
+    let endstop = state.endstop_mut(oid).expect("validated above");
     endstop.start_homing(
         clock,
         sample_ticks,
@@ -119,6 +122,17 @@ mod tests {
             endstop_home(&mut state, 20, 1000, 500, 3, 100, true, 99, 1),
             Err(CommandError::UnknownOid(99))
         );
+    }
+
+    #[test]
+    fn endstop_home_zero_sample_count_does_not_require_trsync() {
+        let mut state = State::new();
+        config_endstop(&mut state, 20).unwrap();
+        assert_eq!(
+            endstop_home(&mut state, 20, 1000, 500, 0, 100, true, 99, 1),
+            Ok(())
+        );
+        assert!(!state.endstop(20).unwrap().is_homing());
     }
 
     #[test]
