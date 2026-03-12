@@ -237,6 +237,12 @@ impl HardwareStepper {
         Ok(now.wrapping_add(2))
     }
 
+    /// Current step interval (clock ticks between steps).
+    /// Updated by `step_event()` when `add != 0`.
+    pub fn current_interval(&self) -> u32 {
+        self.current_interval
+    }
+
     /// Returns the next scheduled step clock.
     pub fn next_step_clock(&self) -> u32 {
         self.next_step_clock
