@@ -248,6 +248,17 @@ impl HardwareStepper {
         self.next_step_clock
     }
 
+    /// Rebase the active segment clock after a missed-deadline nudge.
+    ///
+    /// `check_deadline()` may return an adjusted immediate clock when the
+    /// scheduled step is already in the past. If the caller executes at that
+    /// adjusted time, the internal schedule must also move to that adjusted
+    /// time so subsequent steps keep their requested spacing instead of
+    /// remaining anchored to a stale clock.
+    pub fn rebase_next_step_clock(&mut self, clock: u32) {
+        self.next_step_clock = clock;
+    }
+
     /// Returns the current DIR state.
     pub fn dir_state(&self) -> bool {
         self.dir_state
@@ -515,5 +526,26 @@ mod hardware_stepper_tests {
 
         s.step_event(); // count -> 0
         assert!(!s.has_active_segment());
+    }
+
+    #[test]
+    fn rebase_next_step_clock_preserves_spacing_after_nudge() {
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+
+        let m = StepMove {
+            dir_changed: false,
+            ..StepMove::new(100, 2, 0)
+        };
+        s.load_move(m);
+
+        let adjusted = s.check_deadline(s.next_step_clock(), 1000, 84_000_000);
+        assert_eq!(adjusted, Ok(1002));
+
+        s.rebase_next_step_clock(1002);
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext { clock: 1102 }
+        );
     }
 }
