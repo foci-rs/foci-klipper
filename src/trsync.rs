@@ -70,6 +70,10 @@ impl TrSync {
         self.report_clock = report_clock;
         self.report_ticks = report_ticks;
         self.expire_reason = expire_reason;
+        // Default expire_clock to report_clock so check_timeout doesn't
+        // fire before trsync_set_timeout is called. Matches Klipper C
+        // trsync.c which sets expire_time = report_clock in trsync_start.
+        self.expire_clock = report_clock;
     }
 
     /// Trigger the TrSync with the given reason code.
@@ -360,5 +364,34 @@ mod tests {
         // Next report_clock wraps: 0xFFFFFF00 + 0x200 = 0x0000_0100
         assert!(!ts.report_due(0x0000_00FFu32));
         assert!(ts.report_due(0x0000_0100u32));
+    }
+
+    // --- arm sets expire_clock ---
+
+    #[test]
+    fn arm_sets_expire_clock_to_report_clock() {
+        let mut ts = TrSync::new();
+        // arm with report_clock=5000; expire_clock should be 5000
+        ts.arm(5000, 500, 1);
+        // check_timeout before report_clock must not fire
+        assert!(!ts.check_timeout(4999));
+        assert_eq!(ts.state(), TrSyncState::Armed);
+        // check_timeout at report_clock fires (default expire = report_clock)
+        assert!(ts.check_timeout(5000));
+        assert_eq!(ts.state(), TrSyncState::Triggered(1));
+    }
+
+    #[test]
+    fn arm_expire_clock_overridden_by_set_timeout() {
+        let mut ts = TrSync::new();
+        // arm with report_clock=1000, then extend timeout to 5000
+        ts.arm(1000, 500, 2);
+        ts.set_timeout(5000);
+        // check_timeout at 1000 must not fire (overridden to 5000)
+        assert!(!ts.check_timeout(1000));
+        assert_eq!(ts.state(), TrSyncState::Armed);
+        // fires at 5000
+        assert!(ts.check_timeout(5000));
+        assert_eq!(ts.state(), TrSyncState::Triggered(2));
     }
 }
