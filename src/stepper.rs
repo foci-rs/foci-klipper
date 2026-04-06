@@ -4,6 +4,10 @@
 //! - `HardwareStepper`: Timer-driven GPIO step/dir scheduling engine.
 //!   Matches Klipper `stepper.c` scheduling semantics.
 
+/// Scheduled step time was more than 1ms in the past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct MissedDeadline;
+
 /// A single move segment from Klipper's `queue_step` command.
 #[derive(Debug, Clone, Copy, defmt::Format)]
 pub struct StepMove {
@@ -208,7 +212,12 @@ impl HardwareStepper {
     ///
     /// `clock_freq` is the timer frequency (84 MHz for TIM5). The 1ms
     /// threshold is `clock_freq / 1000`.
-    pub fn check_deadline(&self, scheduled: u32, now: u32, clock_freq: u32) -> Result<u32, ()> {
+    pub fn check_deadline(
+        &self,
+        scheduled: u32,
+        now: u32,
+        clock_freq: u32,
+    ) -> Result<u32, MissedDeadline> {
         if !self.was_active {
             // First activation after idle: no past-time check.
             // Fire immediately if past, or at scheduled time if future.
@@ -230,7 +239,7 @@ impl HardwareStepper {
         let threshold = (clock_freq / 1000) as i32; // 1ms in timer ticks
         if diff < -threshold {
             // More than 1ms past: fatal.
-            return Err(());
+            return Err(MissedDeadline);
         }
 
         // Within 1ms: nudge to now + minimum offset.
@@ -479,7 +488,7 @@ mod hardware_stepper_tests {
         s.was_active = true;
         // Step is 100000 ticks in the past (>1ms at 84 MHz).
         let result = s.check_deadline(1000, 101_000, 84_000_000);
-        assert_eq!(result, Err(()));
+        assert_eq!(result, Err(MissedDeadline));
     }
 
     #[test]
