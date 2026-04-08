@@ -46,19 +46,34 @@ pub fn trsync_set_timeout(state: &mut State, oid: u8, clock: u32) -> Result<(), 
     Ok(())
 }
 
-/// Manually trigger a TrSync with the given reason code.
+/// Manually trigger a TrSync and unconditionally clean up.
 ///
-/// Returns `Ok(true)` if the trigger was accepted (TrSync was Armed).
-/// Returns `Ok(false)` if the TrSync exists but was not Armed.
+/// Mirrors Klipper C's `command_trsync_trigger`: attempts to trigger (no-op
+/// if already triggered or idle), then unconditionally stops the report and
+/// expire timers by resetting to Idle.
+///
+/// Returns `Ok(trigger_reason)` — the reason from the triggered state (or
+/// the newly supplied `reason` if the trigger was accepted now).
 /// Returns `Err(UnknownOid)` if the OID is not registered.
-/// When accepted, all steppers linked to this TrSync are stopped.
-pub fn trsync_trigger(state: &mut State, oid: u8, reason: u8) -> Result<bool, CommandError> {
-    let ts = state.trsync_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
-    let accepted = ts.trigger(reason);
-    if accepted {
+///
+/// The caller must send a final `trsync_state` reply with `can_trigger=0`
+/// and the returned `trigger_reason`.
+pub fn trsync_trigger(state: &mut State, oid: u8, reason: u8) -> Result<u8, CommandError> {
+    // Trigger + extract reason + disarm in one borrow, then stop steppers.
+    // Uses disarm() (not reset()) to preserve trigger_reason across multiple
+    // trsync_trigger calls — the trdispatch C helper sends one, then stop()
+    // sends another, and both must see the original endstop trigger_reason.
+    let (first_trigger, trigger_reason) = {
+        let ts = state.trsync_mut(oid).ok_or(CommandError::UnknownOid(oid))?;
+        let first_trigger = ts.trigger(reason);
+        let trigger_reason = ts.trigger_reason();
+        ts.disarm();
+        (first_trigger, trigger_reason)
+    };
+    if first_trigger {
         stop_linked_steppers(state, oid);
     }
-    Ok(accepted)
+    Ok(trigger_reason)
 }
 
 /// Stop all steppers linked to the given TrSync OID.
@@ -129,19 +144,37 @@ mod tests {
     }
 
     #[test]
-    fn trsync_trigger_accepted() {
+    fn trsync_trigger_accepted_and_disarms() {
         let mut state = State::new();
         config_trsync(&mut state, 10).unwrap();
         trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
-        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(true));
+        // Returns the trigger reason; state stays Triggered (not Idle)
+        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(2));
         assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(2));
     }
 
     #[test]
-    fn trsync_trigger_not_armed() {
+    fn trsync_trigger_not_armed_returns_zero() {
         let mut state = State::new();
         config_trsync(&mut state, 10).unwrap();
-        assert_eq!(trsync_trigger(&mut state, 10, 1), Ok(false));
+        // Idle trsync: trigger is no-op, reason is 0
+        assert_eq!(trsync_trigger(&mut state, 10, 1), Ok(0));
+        assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Idle);
+    }
+
+    #[test]
+    fn trsync_trigger_already_triggered_preserves_reason() {
+        let mut state = State::new();
+        config_trsync(&mut state, 10).unwrap();
+        trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
+        // Endstop triggers with reason 1
+        state.trsync_mut(10).unwrap().trigger(1);
+        // trdispatch C helper sends trsync_trigger with reason 2 — returns original 1
+        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(1));
+        assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(1));
+        // stop() sends another trsync_trigger with reason 2 — still returns original 1
+        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(1));
+        assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(1));
     }
 
     #[test]
@@ -152,8 +185,21 @@ mod tests {
 
         trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
         stepper_stop_on_trigger(&mut state, 0, 10).unwrap();
-        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(true));
+        assert_eq!(trsync_trigger(&mut state, 10, 2), Ok(2));
         assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(2));
+    }
+
+    #[test]
+    fn trsync_start_clears_previous_trigger() {
+        let mut state = State::new();
+        config_trsync(&mut state, 10).unwrap();
+        trsync_start(&mut state, 10, 1000, 500, 1).unwrap();
+        trsync_trigger(&mut state, 10, 5).unwrap();
+        // State is Triggered(5) after trigger + disarm
+        assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Triggered(5));
+        // Re-arm for next homing cycle clears everything
+        trsync_start(&mut state, 10, 2000, 500, 2).unwrap();
+        assert_eq!(state.trsync(10).unwrap().state(), TrSyncState::Armed);
     }
 
     #[test]

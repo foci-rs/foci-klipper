@@ -36,6 +36,11 @@ pub struct TrSync {
     report_clock: u32,
     /// Number of ticks between successive status reports.
     report_ticks: u32,
+    /// Whether [`set_timeout`](Self::set_timeout) has been called since the
+    /// last [`arm`](Self::arm). Mirrors Klipper C, where the expire timer
+    /// is only added to the scheduler in `command_trsync_set_timeout`, not
+    /// in `command_trsync_start`.
+    timeout_set: bool,
 }
 
 impl TrSync {
@@ -47,12 +52,22 @@ impl TrSync {
             expire_clock: 0,
             report_clock: 0,
             report_ticks: 0,
+            timeout_set: false,
         }
     }
 
     /// Return the current state.
     pub fn state(&self) -> TrSyncState {
         self.state
+    }
+
+    /// Return the trigger reason if currently in the [`TrSyncState::Triggered`]
+    /// state, or `0` otherwise.
+    pub fn trigger_reason(&self) -> u8 {
+        match self.state {
+            TrSyncState::Triggered(reason) => reason,
+            _ => 0,
+        }
     }
 
     /// Arm the TrSync for homing.
@@ -70,10 +85,10 @@ impl TrSync {
         self.report_clock = report_clock;
         self.report_ticks = report_ticks;
         self.expire_reason = expire_reason;
-        // Default expire_clock to report_clock so check_timeout doesn't
-        // fire before trsync_set_timeout is called. Matches Klipper C
-        // trsync.c which sets expire_time = report_clock in trsync_start.
-        self.expire_clock = report_clock;
+        self.expire_clock = 0;
+        // Suppress timeout until set_timeout() is called, matching Klipper C
+        // where the expire timer is only started in command_trsync_set_timeout.
+        self.timeout_set = false;
     }
 
     /// Trigger the TrSync with the given reason code.
@@ -96,14 +111,22 @@ impl TrSync {
     /// will auto-trigger with `expire_reason`.
     pub fn set_timeout(&mut self, clock: u32) {
         self.expire_clock = clock;
+        self.timeout_set = true;
     }
 
     /// Check whether the expiry deadline has passed.
     ///
-    /// If `now` is at or past `expire_clock` (using signed wraparound
-    /// comparison) and the state is [`TrSyncState::Armed`], triggers with
-    /// `expire_reason` and returns `true`. Returns `false` otherwise.
+    /// Returns `false` immediately if [`set_timeout`](Self::set_timeout) has
+    /// not been called since the last [`arm`](Self::arm), matching Klipper C
+    /// where the expire timer is only active after `trsync_set_timeout`.
+    ///
+    /// Otherwise, if `now` is at or past `expire_clock` (using signed
+    /// wraparound comparison) and the state is [`TrSyncState::Armed`],
+    /// triggers with `expire_reason` and returns `true`.
     pub fn check_timeout(&mut self, now: u32) -> bool {
+        if !self.timeout_set {
+            return false;
+        }
         let diff = now.wrapping_sub(self.expire_clock) as i32;
         if diff >= 0 {
             self.trigger(self.expire_reason)
@@ -114,11 +137,13 @@ impl TrSync {
 
     /// Check whether a status report is due.
     ///
-    /// Returns `false` immediately when in [`TrSyncState::Idle`]. Otherwise,
-    /// if `now` is at or past `report_clock`, advances `report_clock` by
-    /// `report_ticks` and returns `true`.
+    /// Returns `false` immediately when in [`TrSyncState::Idle`] or when
+    /// `report_ticks` is zero (matching Klipper C, which does not start the
+    /// report timer when `report_ticks == 0`). Otherwise, if `now` is at or
+    /// past `report_clock`, advances `report_clock` by `report_ticks` and
+    /// returns `true`.
     pub fn report_due(&mut self, now: u32) -> bool {
-        if self.state == TrSyncState::Idle {
+        if self.state == TrSyncState::Idle || self.report_ticks == 0 {
             return false;
         }
         let diff = now.wrapping_sub(self.report_clock) as i32;
@@ -130,15 +155,29 @@ impl TrSync {
         }
     }
 
+    /// Stop report and expire timers without clearing the trigger reason.
+    ///
+    /// Mirrors Klipper C's `command_trsync_trigger` behavior: `ts->flags = 0`
+    /// stops reports and timeouts but preserves `ts->trigger_reason`. This
+    /// allows multiple `trsync_trigger` calls to return the original trigger
+    /// reason (e.g., the trdispatch C helper sends one, then `stop()` sends
+    /// another — both must see the endstop's trigger_reason).
+    pub fn disarm(&mut self) {
+        self.report_ticks = 0;
+        self.timeout_set = false;
+    }
+
     /// Reset to the [`TrSyncState::Idle`] state.
     ///
-    /// Clears all pending trigger, timeout, and reporting state.
+    /// Clears all state including trigger reason. Called by `trsync_start`
+    /// (via `arm`) to prepare for a new homing cycle.
     pub fn reset(&mut self) {
         self.state = TrSyncState::Idle;
         self.expire_reason = 0;
         self.expire_clock = 0;
         self.report_clock = 0;
         self.report_ticks = 0;
+        self.timeout_set = false;
     }
 }
 
@@ -296,6 +335,68 @@ mod tests {
         assert!(ts.report_due(1000));
     }
 
+    #[test]
+    fn report_not_due_when_report_ticks_zero() {
+        let mut ts = TrSync::new();
+        // report_ticks=0 means no reports (matches Klipper C behavior).
+        ts.arm(0, 0, 0);
+        assert!(!ts.report_due(0));
+        assert!(!ts.report_due(1000));
+        // Also not due after triggering.
+        ts.trigger(1);
+        assert!(!ts.report_due(1000));
+    }
+
+    // --- trigger_reason ---
+
+    #[test]
+    fn trigger_reason_when_idle() {
+        let ts = TrSync::new();
+        assert_eq!(ts.trigger_reason(), 0);
+    }
+
+    #[test]
+    fn trigger_reason_when_armed() {
+        let mut ts = TrSync::new();
+        ts.arm(0, 0, 0xAB);
+        assert_eq!(ts.trigger_reason(), 0);
+    }
+
+    #[test]
+    fn trigger_reason_when_triggered() {
+        let mut ts = TrSync::new();
+        ts.arm(0, 0, 0);
+        ts.trigger(42);
+        assert_eq!(ts.trigger_reason(), 42);
+    }
+
+    // --- disarm ---
+
+    #[test]
+    fn disarm_stops_reports_but_keeps_trigger_reason() {
+        let mut ts = TrSync::new();
+        ts.arm(1000, 500, 0);
+        ts.trigger(1);
+        assert!(ts.report_due(1000)); // reports fire before disarm
+        ts.disarm();
+        // After disarm: report_ticks=0, so report_due returns false
+        assert!(!ts.report_due(1500));
+        // But trigger reason is preserved
+        assert_eq!(ts.trigger_reason(), 1);
+        assert_eq!(ts.state(), TrSyncState::Triggered(1));
+    }
+
+    #[test]
+    fn disarm_stops_timeout() {
+        let mut ts = TrSync::new();
+        ts.arm(0, 500, 5);
+        ts.set_timeout(1000);
+        ts.disarm();
+        // timeout_set cleared by disarm
+        assert!(!ts.check_timeout(1000));
+        assert_eq!(ts.state(), TrSyncState::Armed);
+    }
+
     // --- reset ---
 
     #[test]
@@ -366,32 +467,44 @@ mod tests {
         assert!(ts.report_due(0x0000_0100u32));
     }
 
-    // --- arm sets expire_clock ---
+    // --- timeout_set guard ---
 
     #[test]
-    fn arm_sets_expire_clock_to_report_clock() {
+    fn check_timeout_does_not_fire_without_set_timeout() {
         let mut ts = TrSync::new();
-        // arm with report_clock=5000; expire_clock should be 5000
+        // arm() does NOT enable the timeout — matching Klipper C where
+        // the expire timer is only started in trsync_set_timeout.
         ts.arm(5000, 500, 1);
-        // check_timeout before report_clock must not fire
-        assert!(!ts.check_timeout(4999));
+        assert!(!ts.check_timeout(5000));
+        assert!(!ts.check_timeout(u32::MAX));
         assert_eq!(ts.state(), TrSyncState::Armed);
-        // check_timeout at report_clock fires (default expire = report_clock)
-        assert!(ts.check_timeout(5000));
-        assert_eq!(ts.state(), TrSyncState::Triggered(1));
     }
 
     #[test]
-    fn arm_expire_clock_overridden_by_set_timeout() {
+    fn check_timeout_fires_after_set_timeout() {
         let mut ts = TrSync::new();
-        // arm with report_clock=1000, then extend timeout to 5000
         ts.arm(1000, 500, 2);
         ts.set_timeout(5000);
-        // check_timeout at 1000 must not fire (overridden to 5000)
-        assert!(!ts.check_timeout(1000));
+        // Before deadline: no fire
+        assert!(!ts.check_timeout(4999));
         assert_eq!(ts.state(), TrSyncState::Armed);
-        // fires at 5000
+        // At deadline: fires
         assert!(ts.check_timeout(5000));
+        assert_eq!(ts.state(), TrSyncState::Triggered(2));
+    }
+
+    #[test]
+    fn arm_clears_timeout_set() {
+        let mut ts = TrSync::new();
+        ts.arm(0, 0, 1);
+        ts.set_timeout(100);
+        // Re-arm clears timeout_set
+        ts.arm(2000, 200, 2);
+        assert!(!ts.check_timeout(2000));
+        assert_eq!(ts.state(), TrSyncState::Armed);
+        // set_timeout re-enables
+        ts.set_timeout(3000);
+        assert!(ts.check_timeout(3000));
         assert_eq!(ts.state(), TrSyncState::Triggered(2));
     }
 }
