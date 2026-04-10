@@ -1,110 +1,94 @@
-//! Endstop state machine for Klipper homing.
+//! Endstop state machine with two-phase scan/oversample sampling.
 //!
-//! Implements debounced pin sampling during homing with TrSync trigger reporting,
-//! ported from Klipper's `src/endstop.c`.
-//!
-//! # Sampling Algorithm
-//!
-//! The endstop uses a two-phase sampling approach:
-//!
-//! 1. **Scanning** (`sample_ticks`): The pin is sampled at a coarse rate. As soon as
-//!    a sample matches `pin_value`, the state machine switches to oversampling mode.
-//!
-//! 2. **Oversampling** (`rest_ticks`): Consecutive matches are required to confirm the
-//!    trigger. If the pin stops matching at any point, `consecutive` is reset and the
-//!    state machine returns to scanning mode.
-//!
-//! Once `sample_count` consecutive matches are accumulated, [`SampleResult::Triggered`]
-//! is returned and homing stops.
+//! Matches Klipper C's `endstop_event` / `endstop_oversample_event` split.
+//! The caller (P3 ISR) drives the state machine by calling `scan()` or
+//! `oversample()` based on the current phase, and performing the second
+//! GPIO read on `EnterOversamplingNow`.
 
-/// Result of a single endstop sample.
+/// Current sampling phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum EndstopPhase {
+    /// Scanning: sampling at rest_ticks rate, looking for first match.
+    Scanning,
+    /// Oversampling: sampling at sample_ticks rate, counting consecutive matches.
+    Oversampling,
+}
+
+/// Result of a single endstop sample call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SampleResult {
-    /// Homing is not active; sample was ignored.
-    NotHoming,
-    /// Homing is active and the trigger threshold has not been reached yet.
-    Continue,
-    /// The endstop has triggered after `sample_count` consecutive matches.
-    Triggered {
-        /// Trigger reason code to pass to TrSync.
-        reason: u8,
-        /// OID of the TrSync object to notify.
-        trsync_oid: u8,
-    },
+pub enum EndstopSampleResult {
+    /// Not homing; sample ignored.
+    Inactive,
+    /// Reschedule timer at returned clock tick.
+    Reschedule { next_clock: u32 },
+    /// Pin matches during scan phase. Caller must read GPIO again and
+    /// call `oversample()` with the fresh read (C's double-read behavior).
+    EnterOversamplingNow,
+    /// Trigger confirmed. Caller must enter TriggerDomain and call trigger().
+    Triggered { trsync_oid: u8, reason: u8 },
 }
 
-/// Debounced endstop state machine.
-///
-/// Tracks homing state and performs consecutive-match debouncing. The caller is
-/// responsible for scheduling sample calls at the appropriate clock times using
-/// [`next_sample_clock`](Endstop::next_sample_clock).
+/// Two-phase endstop state machine.
 #[derive(Debug, defmt::Format)]
-pub struct Endstop {
-    /// Pin state that indicates a trigger (active-high or active-low).
+pub struct EndstopRuntime {
+    /// Current sampling phase.
+    phase: EndstopPhase,
+    /// Pin level that indicates trigger.
     pin_value: bool,
-    /// Number of consecutive matching samples required to trigger.
-    sample_count: u8,
-    /// Ticks between oversampling checks (after first match, fast rate).
-    /// Maps to Klipper C `sample_time` / protocol `sample_ticks`.
-    sample_ticks: u32,
-    /// Ticks between scanning attempts (no consecutive match, slow rate).
-    /// Maps to Klipper C `rest_time` / protocol `rest_ticks`.
-    rest_ticks: u32,
-    /// Clock tick at which the next sample should be taken.
-    next_sample_clock: u32,
-    /// Current count of consecutive matching samples.
-    consecutive: u8,
-    /// Whether homing is currently active.
+    /// ESF_HOMING equivalent. NOT cleared on trigger.
     homing: bool,
-    /// OID of the TrSync object to notify on trigger, if any.
-    trsync_oid: Option<u8>,
-    /// Reason code to report when triggering TrSync.
+    /// Consecutive match countdown (starts at sample_count).
+    trigger_count: u8,
+    /// Total consecutive matches required.
+    sample_count: u8,
+    /// Fast oversampling interval (C: sample_time).
+    sample_ticks: u32,
+    /// Slow scanning interval (C: rest_time).
+    rest_ticks: u32,
+    /// Scan-rate fallback wake time. Returned by endstop_query_state.
+    nextwake: u32,
+    /// TrSync OID to trigger on confirmed match.
+    trsync_oid: u8,
+    /// Reason code for TrSync trigger.
     trigger_reason: u8,
+    /// Configured GPIO pin ID (copied for query snapshot).
+    pin_id: u8,
 }
 
-impl Endstop {
-    /// Create a new `Endstop` in the idle (not homing) state.
+impl EndstopRuntime {
     pub const fn new() -> Self {
         Self {
+            phase: EndstopPhase::Scanning,
             pin_value: false,
+            homing: false,
+            trigger_count: 0,
             sample_count: 0,
             sample_ticks: 0,
             rest_ticks: 0,
-            next_sample_clock: 0,
-            consecutive: 0,
-            homing: false,
-            trsync_oid: None,
+            nextwake: 0,
+            trsync_oid: 0,
             trigger_reason: 0,
+            pin_id: 0xFF,
         }
     }
 
-    /// Returns `true` if homing is currently active.
     pub fn is_homing(&self) -> bool {
         self.homing
     }
 
-    /// Returns the clock tick at which the next sample should be taken.
-    ///
-    /// Only meaningful when [`is_homing`](Self::is_homing) returns `true`.
-    pub fn next_sample_clock(&self) -> u32 {
-        self.next_sample_clock
+    pub fn phase(&self) -> EndstopPhase {
+        self.phase
     }
 
-    /// Arm the endstop for homing.
-    ///
-    /// Configures all homing parameters and activates sampling. After this call,
-    /// [`sample`](Self::sample) should be called at each scheduled clock tick.
-    ///
-    /// # Parameters
-    ///
-    /// - `clock`: Clock tick of the first sample.
-    /// - `sample_ticks`: Ticks between samples during scanning.
-    /// - `sample_count`: Consecutive matches required to trigger. A value of 0
-    ///   stops homing (disarms the endstop without triggering).
-    /// - `rest_ticks`: Ticks between samples during oversampling.
-    /// - `pin_value`: The pin level that indicates a trigger.
-    /// - `trsync_oid`: OID of the TrSync object to notify on trigger.
-    /// - `trigger_reason`: Reason code to include in the TrSync trigger.
+    pub fn nextwake(&self) -> u32 {
+        self.nextwake
+    }
+
+    pub fn pin_id(&self) -> u8 {
+        self.pin_id
+    }
+
+    /// Arm the endstop for homing. sample_count=0 disarms.
     #[allow(clippy::too_many_arguments)]
     pub fn start_homing(
         &mut self,
@@ -115,85 +99,78 @@ impl Endstop {
         pin_value: bool,
         trsync_oid: u8,
         trigger_reason: u8,
+        pin_id: u8,
     ) {
         if sample_count == 0 {
-            // A sample_count of zero disarms the endstop.
             self.homing = false;
-            self.trsync_oid = None;
             return;
         }
-
-        self.next_sample_clock = clock;
-        self.sample_ticks = sample_ticks;
-        self.sample_count = sample_count;
-        self.rest_ticks = rest_ticks;
+        self.phase = EndstopPhase::Scanning;
         self.pin_value = pin_value;
-        self.trsync_oid = Some(trsync_oid);
-        self.trigger_reason = trigger_reason;
-        self.consecutive = sample_count;
         self.homing = true;
+        self.trigger_count = sample_count;
+        self.sample_count = sample_count;
+        self.sample_ticks = sample_ticks;
+        self.rest_ticks = rest_ticks;
+        self.nextwake = clock;
+        self.trsync_oid = trsync_oid;
+        self.trigger_reason = trigger_reason;
+        self.pin_id = pin_id;
     }
 
-    /// Process one pin sample at the given clock time.
-    ///
-    /// # Parameters
-    ///
-    /// - `pin_state`: Current logical state of the pin.
-    /// - `clock`: Current clock tick (used to schedule the next sample).
-    ///
-    /// # Returns
-    ///
-    /// - [`SampleResult::NotHoming`] if homing is not active.
-    /// - [`SampleResult::Triggered`] if `sample_count` consecutive matches have
-    ///   been observed; homing is stopped automatically.
-    /// - [`SampleResult::Continue`] otherwise; [`next_sample_clock`](Self::next_sample_clock)
-    ///   has been updated for the next scheduled call.
-    pub fn sample(&mut self, pin_state: bool, clock: u32) -> SampleResult {
+    /// Scanning phase. Called at rest_ticks intervals.
+    pub fn scan(&mut self, pin_state: bool, waketime: u32) -> EndstopSampleResult {
         if !self.homing {
-            return SampleResult::NotHoming;
+            return EndstopSampleResult::Inactive;
         }
-
-        if pin_state == self.pin_value {
-            // Pin matches — accumulate toward trigger.
-            self.consecutive -= 1;
-            if self.consecutive == 0 {
-                // Threshold reached: trigger and stop homing.
-                let trsync_oid = self.trsync_oid.unwrap_or(0);
-                let reason = self.trigger_reason;
-                self.homing = false;
-                self.consecutive = 0;
-                return SampleResult::Triggered { reason, trsync_oid };
-            }
-            // Schedule next oversampling check (fast rate, matches C sample_time).
-            self.next_sample_clock = clock.wrapping_add(self.sample_ticks);
-        } else {
-            // Pin does not match — reset consecutive counter and return to scanning
-            // (slow rate, matches C rest_time).
-            self.consecutive = self.sample_count;
-            self.next_sample_clock = clock.wrapping_add(self.rest_ticks);
+        let next_scan = waketime.wrapping_add(self.rest_ticks);
+        if pin_state != self.pin_value {
+            return EndstopSampleResult::Reschedule {
+                next_clock: next_scan,
+            };
         }
-
-        SampleResult::Continue
+        // Match: save nextwake, enter oversampling.
+        self.nextwake = next_scan;
+        self.phase = EndstopPhase::Oversampling;
+        EndstopSampleResult::EnterOversamplingNow
     }
 
-    /// Stop homing and reset the consecutive match counter.
-    ///
-    /// Safe to call at any time, including when not homing.
-    pub fn stop(&mut self) {
-        self.homing = false;
-        self.consecutive = 0;
+    /// Oversampling phase. Called at sample_ticks intervals.
+    /// First call is immediate after scan() match (double-read).
+    pub fn oversample(&mut self, pin_state: bool, waketime: u32) -> EndstopSampleResult {
+        if pin_state != self.pin_value {
+            // Mismatch: return to scanning at saved nextwake.
+            self.phase = EndstopPhase::Scanning;
+            self.trigger_count = self.sample_count;
+            return EndstopSampleResult::Reschedule {
+                next_clock: self.nextwake,
+            };
+        }
+        self.trigger_count -= 1;
+        if self.trigger_count == 0 {
+            // Confirmed. homing stays true (ESF_HOMING lifecycle).
+            return EndstopSampleResult::Triggered {
+                trsync_oid: self.trsync_oid,
+                reason: self.trigger_reason,
+            };
+        }
+        EndstopSampleResult::Reschedule {
+            next_clock: waketime.wrapping_add(self.sample_ticks),
+        }
     }
 
-    /// Return the current homing state and next sample clock for a query response.
-    ///
-    /// Returns `(homing, next_sample_clock)`. Matches the data expected by
-    /// Klipper's `endstop_state` response message.
+    /// Return query state: (homing, nextwake).
     pub fn query_state(&self) -> (bool, u32) {
-        (self.homing, self.next_sample_clock)
+        (self.homing, self.nextwake)
+    }
+
+    /// Full reset to unconfigured state.
+    pub fn reset(&mut self) {
+        *self = Self::new();
     }
 }
 
-impl Default for Endstop {
+impl Default for EndstopRuntime {
     fn default() -> Self {
         Self::new()
     }
@@ -203,189 +180,135 @@ impl Default for Endstop {
 mod tests {
     use super::*;
 
-    fn armed_endstop() -> Endstop {
-        let mut e = Endstop::new();
-        e.start_homing(
-            1000, // clock
-            500,  // sample_ticks
-            3,    // sample_count
-            100,  // rest_ticks
-            true, // pin_value (active-high)
-            7,    // trsync_oid
-            42,   // trigger_reason
-        );
+    fn armed_endstop() -> EndstopRuntime {
+        let mut e = EndstopRuntime::new();
+        e.start_homing(1000, 50, 4, 500, true, 7, 42, 0x10);
         e
     }
 
     #[test]
     fn new_endstop_not_homing() {
-        let e = Endstop::new();
+        let e = EndstopRuntime::new();
         assert!(!e.is_homing());
     }
 
     #[test]
-    fn start_homing_sets_state() {
+    fn start_homing_arms() {
         let e = armed_endstop();
         assert!(e.is_homing());
-        assert_eq!(e.next_sample_clock(), 1000);
+        assert_eq!(e.phase(), EndstopPhase::Scanning);
+        assert_eq!(e.nextwake(), 1000);
     }
 
     #[test]
-    fn start_homing_zero_sample_count_disarms() {
+    fn start_homing_zero_disarms() {
         let mut e = armed_endstop();
-        assert!(e.is_homing());
-        e.start_homing(0, 500, 0, 100, true, 7, 42);
+        e.start_homing(0, 0, 0, 0, false, 0, 0, 0);
         assert!(!e.is_homing());
     }
 
     #[test]
-    fn sample_not_homing_returns_not_homing() {
-        let mut e = Endstop::new();
-        let result = e.sample(true, 1000);
-        assert_eq!(result, SampleResult::NotHoming);
+    fn scan_no_match_reschedules_at_rest_ticks() {
+        let mut e = armed_endstop();
+        let result = e.scan(false, 1000);
+        assert_eq!(result, EndstopSampleResult::Reschedule { next_clock: 1500 });
+        assert_eq!(e.phase(), EndstopPhase::Scanning);
     }
 
     #[test]
-    fn sample_trigger_after_consecutive_matches() {
+    fn scan_match_enters_oversample() {
         let mut e = armed_endstop();
+        let result = e.scan(true, 1000);
+        assert_eq!(result, EndstopSampleResult::EnterOversamplingNow);
+        assert_eq!(e.phase(), EndstopPhase::Oversampling);
+        assert_eq!(e.nextwake(), 1500); // saved scan fallback
+    }
 
-        // First match — not yet triggered (need 3)
-        let r = e.sample(true, 1000);
-        assert_eq!(r, SampleResult::Continue);
-        assert!(e.is_homing());
+    #[test]
+    fn oversample_mismatch_returns_to_scanning() {
+        let mut e = armed_endstop();
+        e.scan(true, 1000); // enter oversample
+        let result = e.oversample(false, 1000);
+        assert_eq!(result, EndstopSampleResult::Reschedule { next_clock: 1500 });
+        assert_eq!(e.phase(), EndstopPhase::Scanning);
+    }
 
-        // Second match
-        let r = e.sample(true, 1100);
-        assert_eq!(r, SampleResult::Continue);
-        assert!(e.is_homing());
+    #[test]
+    fn oversample_counts_down_to_trigger() {
+        let mut e = armed_endstop(); // sample_count=4
+        e.scan(true, 1000); // enter oversample, nextwake=1500
 
-        // Third match — triggers
-        let r = e.sample(true, 1200);
+        // First oversample (double-read at same instant)
+        let r = e.oversample(true, 1000);
+        assert_eq!(r, EndstopSampleResult::Reschedule { next_clock: 1050 });
+
+        // Second oversample
+        let r = e.oversample(true, 1050);
+        assert_eq!(r, EndstopSampleResult::Reschedule { next_clock: 1100 });
+
+        // Third oversample
+        let r = e.oversample(true, 1100);
+        assert_eq!(r, EndstopSampleResult::Reschedule { next_clock: 1150 });
+
+        // Fourth oversample — triggers
+        let r = e.oversample(true, 1150);
         assert_eq!(
             r,
-            SampleResult::Triggered {
-                reason: 42,
+            EndstopSampleResult::Triggered {
                 trsync_oid: 7,
-            }
-        );
-        assert!(!e.is_homing());
-    }
-
-    #[test]
-    fn sample_resets_counter_on_mismatch() {
-        let mut e = armed_endstop();
-
-        // Two matches
-        assert_eq!(e.sample(true, 1000), SampleResult::Continue);
-        assert_eq!(e.sample(true, 1100), SampleResult::Continue);
-
-        // Mismatch resets — next sample uses rest_ticks (scanning rate)
-        let r = e.sample(false, 1200);
-        assert_eq!(r, SampleResult::Continue);
-        assert!(e.is_homing());
-        // After mismatch the next clock should be clock + rest_ticks
-        assert_eq!(e.next_sample_clock(), 1200 + 100);
-
-        // Need 3 more consecutive matches to trigger now
-        assert_eq!(e.sample(true, 1700), SampleResult::Continue);
-        assert_eq!(e.sample(true, 1800), SampleResult::Continue);
-        assert_eq!(
-            e.sample(true, 1900),
-            SampleResult::Triggered {
                 reason: 42,
-                trsync_oid: 7,
             }
         );
     }
 
     #[test]
-    fn next_sample_clock_uses_sample_ticks_on_match() {
+    fn homing_stays_true_after_trigger() {
         let mut e = armed_endstop();
-        e.sample(true, 1000);
-        // After a match, oversample at sample_ticks rate = 1000 + 500
-        assert_eq!(e.next_sample_clock(), 1500);
+        e.scan(true, 1000);
+        e.oversample(true, 1000);
+        e.oversample(true, 1050);
+        e.oversample(true, 1100);
+        e.oversample(true, 1150); // triggers
+        assert!(e.is_homing()); // ESF_HOMING stays true
     }
 
     #[test]
-    fn next_sample_clock_uses_rest_ticks_on_mismatch() {
-        let mut e = armed_endstop();
-        e.sample(false, 1000);
-        // After a mismatch, scan at rest_ticks rate = 1000 + 100
-        assert_eq!(e.next_sample_clock(), 1100);
+    fn scan_when_not_homing_returns_inactive() {
+        let mut e = EndstopRuntime::new();
+        assert_eq!(e.scan(true, 0), EndstopSampleResult::Inactive);
     }
 
     #[test]
-    fn stop_clears_homing_state() {
-        let mut e = armed_endstop();
-        assert!(e.is_homing());
-        e.stop();
-        assert!(!e.is_homing());
-    }
-
-    #[test]
-    fn stop_when_not_homing_is_safe() {
-        let mut e = Endstop::new();
-        e.stop(); // should not panic
-        assert!(!e.is_homing());
-    }
-
-    #[test]
-    fn query_state_returns_homing_and_clock() {
+    fn nextwake_initialized_on_arm() {
         let e = armed_endstop();
-        let (homing, clock) = e.query_state();
+        assert_eq!(e.nextwake(), 1000); // first wake clock
+    }
+
+    #[test]
+    fn nextwake_updated_on_oversample_entry() {
+        let mut e = armed_endstop();
+        e.scan(true, 2000); // nextwake = 2000 + 500 = 2500
+        assert_eq!(e.nextwake(), 2500);
+    }
+
+    #[test]
+    fn clock_wraparound_scan() {
+        let mut e = EndstopRuntime::new();
+        e.start_homing(0xFFFF_FF00, 50, 3, 100, true, 1, 1, 0x10);
+        let result = e.scan(false, 0xFFFF_FF00);
+        assert_eq!(
+            result,
+            EndstopSampleResult::Reschedule {
+                next_clock: 0xFFFF_FF00u32.wrapping_add(100),
+            }
+        );
+    }
+
+    #[test]
+    fn query_state_returns_homing_and_nextwake() {
+        let e = armed_endstop();
+        let (homing, nextwake) = e.query_state();
         assert!(homing);
-        assert_eq!(clock, 1000);
-    }
-
-    #[test]
-    fn query_state_not_homing() {
-        let e = Endstop::new();
-        let (homing, _clock) = e.query_state();
-        assert!(!homing);
-    }
-
-    #[test]
-    fn sample_after_stop_returns_not_homing() {
-        let mut e = armed_endstop();
-        e.stop();
-        let r = e.sample(true, 5000);
-        assert_eq!(r, SampleResult::NotHoming);
-    }
-
-    #[test]
-    fn clock_wraparound_sample_ticks() {
-        let mut e = Endstop::new();
-        e.start_homing(0xFFFF_FF00, 500, 3, 100, true, 1, 1);
-        // Match at near-wrap clock; oversample at sample_ticks, should wrap
-        e.sample(true, 0xFFFF_FF00);
-        assert_eq!(e.next_sample_clock(), 0xFFFF_FF00u32.wrapping_add(500));
-    }
-
-    #[test]
-    fn clock_wraparound_rest_ticks() {
-        let mut e = Endstop::new();
-        e.start_homing(0xFFFF_FF00, 500, 3, 100, true, 1, 1);
-        // Mismatch at near-wrap clock; scan at rest_ticks, should wrap
-        e.sample(false, 0xFFFF_FF00);
-        assert_eq!(e.next_sample_clock(), 0xFFFF_FF00u32.wrapping_add(100));
-    }
-
-    #[test]
-    fn default_is_same_as_new() {
-        let a = Endstop::new();
-        let b = Endstop::default();
-        assert_eq!(a.is_homing(), b.is_homing());
-        assert_eq!(a.next_sample_clock(), b.next_sample_clock());
-    }
-
-    #[test]
-    fn triggered_stops_homing() {
-        let mut e = armed_endstop();
-        e.sample(true, 1000);
-        e.sample(true, 1100);
-        let r = e.sample(true, 1200);
-        assert!(matches!(r, SampleResult::Triggered { .. }));
-        // Subsequent samples after trigger return NotHoming
-        assert_eq!(e.sample(true, 2000), SampleResult::NotHoming);
+        assert_eq!(nextwake, 1000);
     }
 }

@@ -3,7 +3,8 @@
 pub mod clock;
 pub mod commands;
 pub mod endstop;
+pub mod scheduler;
 pub mod shutdown;
 pub mod state;
 pub mod stepper;
-pub mod trsync;
+pub mod trigger;

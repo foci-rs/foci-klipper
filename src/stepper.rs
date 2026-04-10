@@ -157,6 +157,19 @@ impl HardwareStepper {
         self.was_active = false;
     }
 
+    /// Reset the ISR stepper engine to idle state.
+    ///
+    /// Clears the active segment so the next ISR entry dequeues a fresh
+    /// move. Called by `stop_physical_stepper_no_lock()` after disabling
+    /// the step timer to prevent stale partial segments from executing
+    /// when the timer is re-armed.
+    pub fn reset(&mut self) {
+        self.current_count = 0;
+        self.current_interval = 0;
+        self.current_add = 0;
+        self.was_active = false;
+    }
+
     // --- P3 methods (timer ISR) ---
 
     /// Load a move segment from the queue into the active segment.

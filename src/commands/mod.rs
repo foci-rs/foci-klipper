@@ -5,11 +5,9 @@
 //! `klipper_reply!`, `klipper_shutdown!`, and hardware I/O.
 
 pub mod digital_out;
-pub mod endstop;
 pub mod lifecycle;
 pub mod spi;
 pub mod stepper;
-pub mod trsync;
 
 /// Errors from shared command handler logic.
 #[derive(Debug, Clone, PartialEq, Eq, defmt::Format)]
