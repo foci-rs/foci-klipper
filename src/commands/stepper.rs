@@ -2,6 +2,7 @@
 
 use crate::commands::CommandError;
 use crate::state::{State, NUM_STEPPERS};
+use crate::stepper::HardwareStepper;
 
 /// Register a stepper motor object by OID.
 ///
@@ -76,9 +77,25 @@ pub fn reset_step_clock_hw(timer_active: bool) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// Rebase both halves of the split hardware stepper clock.
+///
+/// Call only after [`reset_step_clock_hw`] has accepted the reset and the
+/// physical timer is inactive. The command-side stepper records direction
+/// state for future queued moves; the ISR-side stepper owns the clock used
+/// when those moves are executed.
+pub fn reset_stepper_clocks(
+    p2_stepper: &mut HardwareStepper,
+    isr_stepper: &mut HardwareStepper,
+    clock: u32,
+) {
+    p2_stepper.reset_step_clock(clock);
+    isr_stepper.reset_step_clock(clock);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stepper::HardwareStepper;
 
     #[test]
     fn config_stepper_success() {
@@ -151,5 +168,26 @@ mod tests {
     fn reset_step_clock_hw_inactive_ok() {
         let result = reset_step_clock_hw(false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn reset_stepper_clocks_rebases_command_and_isr_state() {
+        let mut p2_stepper = HardwareStepper::new();
+        let mut isr_stepper = HardwareStepper::new();
+
+        isr_stepper.reset_step_clock(0);
+        isr_stepper.load_move(crate::stepper::StepMove::new(50_000, 1, 0));
+        assert_eq!(isr_stepper.next_step_clock(), 50_000);
+
+        reset_stepper_clocks(&mut p2_stepper, &mut isr_stepper, 1_000);
+
+        let queued = p2_stepper.prepare_move(crate::stepper::StepMove::new(250, 1, 0));
+        isr_stepper.load_move(queued);
+
+        assert_eq!(isr_stepper.next_step_clock(), 1_250);
+        assert_eq!(
+            isr_stepper.check_deadline(isr_stepper.next_step_clock(), 1_000, 84_000_000),
+            Ok(1_250)
+        );
     }
 }
