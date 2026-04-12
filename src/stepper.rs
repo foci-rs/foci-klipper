@@ -62,12 +62,53 @@ pub trait StepperPin {
     fn read_clock(&self) -> u32;
 }
 
+/// Minimum timer ticks between a STEP rising edge (step phase) and the
+/// following STEP falling edge (unstep phase).
+///
+/// The TMC4671-LA datasheet caps STEP input frequency at half the chip
+/// oscillator (12.5 MHz for a 25 MHz crystal), which gives a ~40 ns
+/// minimum pulse high time. At 84 MHz TIM5 clock, 8 ticks ≈ 95 ns — well
+/// above the minimum with margin for propagation delay and ISR jitter.
+///
+/// This replaces the host-configurable `step_pulse_ticks` argument of
+/// Klipper C's `config_stepper` (currently ignored by this firmware).
+pub const STEP_PULSE_TICKS: u32 = 8;
+
+/// Phase of a single timer event in full-mode stepping.
+///
+/// In full mode (`STEPPER_STEP_BOTH_EDGE = 0`), each motor step is split
+/// across two timer events. The phase returned from `step_event()` tells
+/// the ISR what action it just completed so position accounting and
+/// scheduling can branch accordingly:
+///
+/// - `Step`: the GPIO toggle drove STEP from LOW to HIGH. This is the
+///   rising edge the driver IC counts as a motor step, so the firmware
+///   position counter should advance by `dir`. The next timer event is
+///   scheduled after `STEP_PULSE_TICKS` to complete the pulse.
+/// - `Unstep`: the GPIO toggle drove STEP from HIGH to LOW. No position
+///   change. The next timer event is scheduled at the current step
+///   interval to begin the next motor step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum StepPhase {
+    /// GPIO just transitioned LOW → HIGH (rising edge). Position advances.
+    Step,
+    /// GPIO just transitioned HIGH → LOW. Position unchanged.
+    Unstep,
+}
+
 /// Result of a single step event in the timer ISR.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepEventResult {
-    /// More steps remain. Schedule next compare at `clock`.
-    ScheduleNext { clock: u32 },
+    /// More events remain. Schedule next compare at `clock`.
+    ///
+    /// `phase` describes the event just processed (the toggle the ISR
+    /// already applied before calling `step_event`).
+    ScheduleNext { clock: u32, phase: StepPhase },
     /// Current segment exhausted. Caller should dequeue next move.
+    ///
+    /// The ISR's GPIO toggle has already driven STEP LOW for this final
+    /// unstep event, so the pin is in the correct quiescent state before
+    /// the next move loads.
     NeedMove,
 }
 
@@ -85,8 +126,14 @@ pub struct HardwareStepper {
     // --- ISR state (P3 only) ---
     /// Current segment interval (ticks between steps).
     current_interval: u32,
-    /// Steps remaining in current segment.
-    current_count: u16,
+    /// Timer events remaining in current segment.
+    ///
+    /// Each motor step requires two timer events in full mode
+    /// (STEPPER_STEP_BOTH_EDGE=0): one to drive STEP HIGH (step phase),
+    /// one to drive STEP LOW (unstep phase). `load_move` stores
+    /// `move.count * 2` here. A `u16` move count can reach 65_535, so
+    /// the doubled value requires `u32`.
+    current_count: u32,
     /// Interval change per step (acceleration).
     current_add: i16,
     /// Clock time of the next step.
@@ -181,7 +228,10 @@ impl HardwareStepper {
     pub fn load_move(&mut self, m: StepMove) -> bool {
         self.was_active = self.was_active || self.current_count > 0;
         self.current_interval = m.interval;
-        self.current_count = m.count;
+        // Full-mode scheduling: two timer events per motor step (step HIGH,
+        // unstep LOW). Double the count so the ISR fires twice per step.
+        // Matches Klipper C stepper_event_full: `s->count = move_count * 2`.
+        self.current_count = (m.count as u32) * 2;
         self.current_add = m.add;
         self.next_step_clock = self.next_step_clock.wrapping_add(m.interval);
         if m.dir_changed {
@@ -190,29 +240,65 @@ impl HardwareStepper {
         m.dir_changed
     }
 
-    /// Execute one step and advance scheduling.
+    /// Execute one timer event and advance scheduling.
     ///
-    /// Called from P3 timer ISR after toggling the STEP GPIO and
-    /// incrementing the position atomic. Returns what the ISR should
-    /// do next: schedule the next compare, or dequeue a new move.
+    /// Called from the P3 timer ISR after toggling the STEP GPIO. Returns
+    /// what the ISR should do next: schedule the next compare (with the
+    /// `StepPhase` of the event just processed), or dequeue a new move.
+    ///
+    /// The event phase is derived from the parity of `current_count`
+    /// after decrement, matching Klipper C `stepper_event_full`:
+    ///
+    /// - odd after decrement → the GPIO just went HIGH (step phase); the
+    ///   ISR must increment STEPPER_POSITION by `dir_state()`. The next
+    ///   event (the unstep) is scheduled at `step_clock + STEP_PULSE_TICKS`
+    ///   to complete the pulse; the base `next_step_clock` is unchanged
+    ///   so the following step lands at `base + interval`, not `base +
+    ///   interval + pulse_ticks`.
+    /// - even after decrement → the GPIO just went LOW (unstep phase); no
+    ///   position change. `next_step_clock` advances by `current_interval`
+    ///   and acceleration (`current_add`) is applied. If the count reaches
+    ///   zero, the segment is exhausted and `NeedMove` is returned.
     ///
     /// Caller is responsible for:
     /// 1. Toggling STEP GPIO before calling this
-    /// 2. Incrementing position atomic before calling this
+    /// 2. Inspecting `StepPhase::Step` in the returned `ScheduleNext` and
+    ///    incrementing the position atomic only in that branch
     pub fn step_event(&mut self) -> StepEventResult {
         self.current_count -= 1;
 
-        if self.current_count > 0 {
-            // Advance interval by acceleration, clamp to minimum 1.
+        // Odd remaining count → we just drove STEP HIGH (step phase).
+        // Even remaining count → we just drove STEP LOW (unstep phase).
+        if self.current_count & 1 == 1 {
+            // Step phase: schedule the pair-matching unstep. The next_step
+            // clock for the *following* motor step stays at the current
+            // value so that after the unstep advances by `interval`, the
+            // following step lands at exactly `step_clock + interval`.
+            let unstep_clock = self.next_step_clock.wrapping_add(STEP_PULSE_TICKS);
+            StepEventResult::ScheduleNext {
+                clock: unstep_clock,
+                phase: StepPhase::Step,
+            }
+        } else {
+            // Unstep phase.
+            if self.current_count == 0 {
+                // Final unstep of this segment — segment exhausted.
+                return StepEventResult::NeedMove;
+            }
+            // Advance interval by acceleration (clamped to ≥ 1), then
+            // advance next_step_clock by the new interval to schedule the
+            // next step. Acceleration applies once per motor step (at the
+            // unstep → next-step transition), matching Klipper semantics
+            // where `s->interval += s->add` happens inside the `count` arm
+            // of `stepper_event_full`.
             self.current_interval = (self.current_interval as i32)
                 .saturating_add(self.current_add as i32)
                 .max(1) as u32;
             self.next_step_clock = self.next_step_clock.wrapping_add(self.current_interval);
             StepEventResult::ScheduleNext {
                 clock: self.next_step_clock,
+                phase: StepPhase::Unstep,
             }
-        } else {
-            StepEventResult::NeedMove
         }
     }
 
@@ -277,6 +363,20 @@ impl HardwareStepper {
     /// adjusted time, the internal schedule must also move to that adjusted
     /// time so subsequent steps keep their requested spacing instead of
     /// remaining anchored to a stale clock.
+    ///
+    /// **Full-mode caveat:** this only applies when the nudged clock
+    /// represents the next *rising edge* cadence anchor — i.e. when the
+    /// most recent `step_event()` returned `StepPhase::Unstep` or before
+    /// the first step of a freshly-loaded segment. Never rebase with the
+    /// unstep (pulse-close) clock returned after a `StepPhase::Step`
+    /// event: that clock is only a few pulse ticks past the rising edge
+    /// and is almost always already in the past by the time the ISR
+    /// reads it, which would pull the cadence anchor forward by the
+    /// pulse-close latency on every step and stretch the effective step
+    /// interval. The ISR handles this by firing the unstep immediately
+    /// without rebasing; the following `StepPhase::Unstep` event then
+    /// schedules the next rising edge correctly from the original step
+    /// clock.
     pub fn rebase_next_step_clock(&mut self, clock: u32) {
         self.next_step_clock = clock;
     }
@@ -358,82 +458,296 @@ mod hardware_stepper_tests {
     }
 
     #[test]
+    fn full_mode_step_event_alternates_step_and_unstep_phase() {
+        // In full mode, each motor step is a pair of timer events:
+        //   event 1 (step):   GPIO toggles LOW → HIGH (rising edge seen by driver)
+        //   event 2 (unstep): GPIO toggles HIGH → LOW
+        // The phase returned by step_event() tells the ISR which event it
+        // just processed so it can update STEPPER_POSITION only on the
+        // step (rising-edge) events.
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+        s.load_move(StepMove {
+            dir_changed: false,
+            ..StepMove::new(100, 2, 0)
+        });
+
+        // 2-step move = 4 timer events: Step, Unstep, Step, Unstep.
+        // The final unstep exhausts the segment, so step_event returns
+        // NeedMove on the 4th call (the ISR still has the GPIO toggle
+        // already applied, which drives STEP LOW).
+        let expected = [StepPhase::Step, StepPhase::Unstep, StepPhase::Step];
+        for (i, exp) in expected.iter().enumerate() {
+            match s.step_event() {
+                StepEventResult::ScheduleNext { phase, .. } => {
+                    assert_eq!(phase, *exp, "wrong phase at event {}", i);
+                }
+                StepEventResult::NeedMove => {
+                    panic!("unexpected NeedMove at event {}", i);
+                }
+            }
+        }
+        // 4th event (final unstep) exhausts the segment.
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
+    }
+
+    #[test]
+    fn full_mode_load_move_doubles_count() {
+        // In full mode (STEPPER_STEP_BOTH_EDGE=0, matching Klipper C
+        // stepper_event_full), each motor step requires two timer events:
+        // one to set STEP HIGH (step), one to set it LOW (unstep).
+        // load_move must double the internal count so the ISR fires
+        // twice per motor step.
+        //
+        // For a 3-motor-step move, we expect 6 step_event calls before
+        // the segment is exhausted.
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+        s.load_move(StepMove {
+            dir_changed: false,
+            ..StepMove::new(100, 3, 0)
+        });
+
+        // 5 non-terminal events (step, unstep, step, unstep, step).
+        for i in 0..5 {
+            let result = s.step_event();
+            assert!(
+                matches!(result, StepEventResult::ScheduleNext { .. }),
+                "expected ScheduleNext at iteration {} but got {:?}",
+                i,
+                result
+            );
+        }
+        // 6th event is the final unstep — segment exhausted.
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
+    }
+
+    #[test]
+    fn step_phase_unstep_clock_does_not_advance_step_cadence_anchor() {
+        // Cadence contract: `next_step_clock` is the base time for the
+        // NEXT rising edge. The Step phase returns an `unstep_clock`
+        // (step_clock + STEP_PULSE_TICKS) intended solely to close the
+        // pulse — this clock is a few tens of nanoseconds wide and will
+        // typically already be in the past by the time the ISR checks
+        // its deadline. Even under that condition the Step phase must
+        // NOT mutate the cadence anchor; the next rising edge must land
+        // at `original_step_clock + interval`, not
+        // `nudged_unstep_clock + interval`.
+        //
+        // This test locks in the stepper-core behaviour the ISR depends
+        // on: step_event() during a Step event does not touch
+        // next_step_clock, so calling step_event() again for the Unstep
+        // phase (without any external rebase) schedules the following
+        // rising edge from the original step_clock.
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+        s.load_move(StepMove {
+            dir_changed: false,
+            ..StepMove::new(100, 2, 0)
+        });
+        // After load_move: next_step_clock = 0 + 100 = 100 (first rising edge).
+
+        // Step 1 rising — unstep scheduled close to the rising edge.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 100 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Cadence anchor still at the rising-edge time, not the unstep time.
+        assert_eq!(s.next_step_clock(), 100);
+
+        // Step 1 falling — the next rising edge MUST be at
+        // original_step_clock (100) + interval (100) = 200. If the
+        // stepper were to anchor off the unstep clock we'd get
+        // 108 + 100 = 208, permanently stretching every subsequent step
+        // period by the pulse-close latency.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 200,
+                phase: StepPhase::Unstep,
+            }
+        );
+        assert_eq!(s.next_step_clock(), 200);
+    }
+
+    #[test]
     fn load_move_and_step_event_counts_down() {
         let mut s = HardwareStepper::new();
         s.reset_step_clock(0);
 
-        let m = StepMove::new(100, 3, 0);
+        // count=3 motor steps → 6 timer events (step/unstep pairs).
+        // Load sets next_step_clock = 0 + 100 = 100 (first step).
         let m = StepMove {
             dir_changed: false,
-            ..m
+            ..StepMove::new(100, 3, 0)
         };
         s.load_move(m);
 
-        // First step.
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 200 });
-
-        // Second step.
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 300 });
-
-        // Third step: segment exhausted.
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::NeedMove);
+        // Event 1 — step 1 rising: unstep scheduled at 100 + STEP_PULSE_TICKS.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 100 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Event 2 — step 1 falling: next step at 100 + 100 = 200.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 200,
+                phase: StepPhase::Unstep,
+            }
+        );
+        // Event 3 — step 2 rising.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 200 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Event 4 — step 2 falling: next step at 200 + 100 = 300.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 300,
+                phase: StepPhase::Unstep,
+            }
+        );
+        // Event 5 — step 3 rising.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 300 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Event 6 — step 3 falling: segment exhausted.
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
     }
 
     #[test]
     fn step_event_applies_acceleration() {
+        // Acceleration (`add`) is applied once per motor step, at the
+        // unstep → next-step transition (even-count branch). Step events
+        // (odd-count branch) do not change the interval, so the pulse
+        // width is always STEP_PULSE_TICKS regardless of acceleration.
         let mut s = HardwareStepper::new();
         s.reset_step_clock(0);
 
-        // 3 steps: intervals 100, 80, 60 (add = -20)
-        let m = StepMove::new(100, 3, -20);
+        // 3 motor steps with add = -20: intervals 100, 80, 60.
         let m = StepMove {
             dir_changed: false,
-            ..m
+            ..StepMove::new(100, 3, -20)
         };
         s.load_move(m);
 
-        let result = s.step_event();
-        // After first step: interval becomes 80, next at 100+80=180
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 180 });
-
-        let result = s.step_event();
-        // After second step: interval becomes 60, next at 180+60=240
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 240 });
-
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::NeedMove);
+        // Step 1 rising (count 6→5): unstep at 100 + pulse.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 100 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 1 falling (count 5→4): interval becomes 80, next step at 180.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 180,
+                phase: StepPhase::Unstep,
+            }
+        );
+        // Step 2 rising (count 4→3).
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 180 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 2 falling (count 3→2): interval becomes 60, next step at 240.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 240,
+                phase: StepPhase::Unstep,
+            }
+        );
+        // Step 3 rising (count 2→1).
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 240 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 3 falling (count 1→0): segment exhausted.
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
     }
 
     #[test]
     fn interval_clamps_to_minimum_one() {
+        // Large negative `add` would drive interval below 1 without the
+        // saturating_add + .max(1) clamp. The clamp is applied on every
+        // unstep → next-step transition.
         let mut s = HardwareStepper::new();
         s.reset_step_clock(0);
 
-        // interval=50, add=-100: would go negative without clamp
-        let m = StepMove::new(50, 3, -100);
+        // interval=50, add=-100 (would become -50, clamped to 1).
         let m = StepMove {
             dir_changed: false,
-            ..m
+            ..StepMove::new(50, 3, -100)
         };
         s.load_move(m);
 
-        // First step: interval 50 -> schedule at 50+50=100.
-        // Then interval becomes max(50-100, 1) = 1.
-        let result = s.step_event();
-        // Next at 50 + 1 = 51? No. Let me trace:
-        // load_move: next_step_clock = 0 + 50 = 50 (first step)
-        // step_event: count 3->2, interval = max(50-100,1)=1, next = 50+1 = 51
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 51 });
-
-        // Second step: interval 1 -> max(1-100,1)=1, next = 51+1 = 52
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 52 });
-
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::NeedMove);
+        // Step 1 rising: unstep at 50 + pulse.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 50 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 1 falling: interval = max(50 - 100, 1) = 1. Next step at 50 + 1 = 51.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 51,
+                phase: StepPhase::Unstep,
+            }
+        );
+        // Step 2 rising: unstep at 51 + pulse.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 51 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 2 falling: interval = max(1 - 100, 1) = 1 (still clamped).
+        // Next step at 51 + 1 = 52.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 52,
+                phase: StepPhase::Unstep,
+            }
+        );
+        // Step 3 rising: unstep at 52 + pulse.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 52 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 3 falling: segment exhausted.
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
     }
 
     #[test]
@@ -506,19 +820,35 @@ mod hardware_stepper_tests {
 
     #[test]
     fn clock_wraparound_scheduling() {
+        // Verify u32 wraparound propagates through both the step-phase
+        // add (STEP_PULSE_TICKS) and the unstep-phase add (interval).
         let mut s = HardwareStepper::new();
         s.reset_step_clock(0xFFFF_FF00);
 
-        let m = StepMove::new(0x100, 2, 0);
         let m = StepMove {
             dir_changed: false,
-            ..m
+            ..StepMove::new(0x100, 2, 0)
         };
         s.load_move(m);
+        // After load_move: next_step_clock = 0xFFFFFF00 + 0x100 = 0x00000000 (wrapped).
 
-        // First step scheduled at 0xFFFFFF00 + 0x100 = 0x00000000 (wraps).
-        let result = s.step_event();
-        assert_eq!(result, StepEventResult::ScheduleNext { clock: 0x00000100 });
+        // Step 1 rising: unstep clock = 0 + STEP_PULSE_TICKS (wrapped add).
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 1 falling: next step clock = 0 + 0x100 = 0x100 (the original
+        // wrap-case). Unstep phase re-exercises the wrapping add.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 0x0000_0100,
+                phase: StepPhase::Unstep,
+            }
+        );
     }
 
     #[test]
@@ -535,6 +865,8 @@ mod hardware_stepper_tests {
         let mut s = HardwareStepper::new();
         assert!(!s.has_active_segment());
 
+        // 2 motor steps → 4 timer events. Segment is active until the 4th
+        // (final unstep) decrements count to 0.
         s.reset_step_clock(0);
         let m = StepMove {
             dir_changed: false,
@@ -543,15 +875,22 @@ mod hardware_stepper_tests {
         s.load_move(m);
         assert!(s.has_active_segment());
 
-        s.step_event();
+        s.step_event(); // step 1 rising: count 4 → 3
+        assert!(s.has_active_segment());
+        s.step_event(); // step 1 falling: count 3 → 2
+        assert!(s.has_active_segment());
+        s.step_event(); // step 2 rising: count 2 → 1
         assert!(s.has_active_segment());
 
-        s.step_event(); // count -> 0
+        s.step_event(); // step 2 falling: count 1 → 0
         assert!(!s.has_active_segment());
     }
 
     #[test]
     fn rebase_next_step_clock_preserves_spacing_after_nudge() {
+        // After a missed-deadline nudge, rebase_next_step_clock updates the
+        // internal reference so the subsequent step/unstep pair lands at
+        // correct offsets from the nudged time (not from the stale original).
         let mut s = HardwareStepper::new();
         s.reset_step_clock(0);
 
@@ -563,11 +902,24 @@ mod hardware_stepper_tests {
 
         let adjusted = s.check_deadline(s.next_step_clock(), 1000, 84_000_000);
         assert_eq!(adjusted, Ok(1002));
-
         s.rebase_next_step_clock(1002);
+
+        // Step 1 rising (at rebased clock 1002): schedule unstep at
+        // 1002 + STEP_PULSE_TICKS.
         assert_eq!(
             s.step_event(),
-            StepEventResult::ScheduleNext { clock: 1102 }
+            StepEventResult::ScheduleNext {
+                clock: 1002 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        // Step 1 falling: next step at rebased 1002 + interval(100) = 1102.
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 1102,
+                phase: StepPhase::Unstep,
+            }
         );
     }
 }
