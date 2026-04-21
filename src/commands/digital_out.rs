@@ -1,7 +1,7 @@
 //! Digital output (motor enable/disable) commands.
 
 use crate::commands::CommandError;
-use crate::state::{State, NUM_STEPPERS};
+use crate::state::{NUM_STEPPERS, State};
 
 /// Register a digital output object for motor enable/disable.
 ///

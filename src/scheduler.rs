@@ -68,11 +68,11 @@ impl TriggerScheduler {
     pub fn cancel<F: Fn(&SchedulerEventKind) -> bool>(&mut self, filter: F) -> usize {
         let mut count = 0;
         for slot in self.events.iter_mut() {
-            if let Some(event) = slot {
-                if filter(&event.kind) {
-                    *slot = None;
-                    count += 1;
-                }
+            if let Some(event) = slot
+                && filter(&event.kind)
+            {
+                *slot = None;
+                count += 1;
             }
         }
         count
@@ -86,11 +86,7 @@ impl TriggerScheduler {
                 None => event.wake_clock,
                 Some(e) => {
                     let delta = event.wake_clock.wrapping_sub(e) as i32;
-                    if delta < 0 {
-                        event.wake_clock
-                    } else {
-                        e
-                    }
+                    if delta < 0 { event.wake_clock } else { e }
                 }
             });
         }

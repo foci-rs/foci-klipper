@@ -1,7 +1,7 @@
 //! Stepper registration and motion commands.
 
 use crate::commands::CommandError;
-use crate::state::{State, NUM_STEPPERS};
+use crate::state::{NUM_STEPPERS, State};
 use crate::stepper::HardwareStepper;
 
 /// Register a stepper motor object by OID.
