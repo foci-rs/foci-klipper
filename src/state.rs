@@ -49,7 +49,7 @@ impl State {
     }
 }
 
-impl anchor::ShutdownState for State {
+impl ankyra::ShutdownState for State {
     fn is_shutdown(&self) -> bool {
         self.mcu_state.is_shutdown()
     }
@@ -98,14 +98,14 @@ mod tests {
 
     #[test]
     fn shutdown_state_configuring() {
-        use anchor::ShutdownState;
+        use ankyra::ShutdownState;
         let state = State::new();
         assert!(!state.is_shutdown());
     }
 
     #[test]
     fn shutdown_state_running() {
-        use anchor::ShutdownState;
+        use ankyra::ShutdownState;
         let mut state = State::new();
         state.mcu_state = McuState::Running;
         assert!(!state.is_shutdown());
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn shutdown_state_shutdown() {
-        use anchor::ShutdownState;
+        use ankyra::ShutdownState;
         let mut state = State::new();
         state.mcu_state = McuState::Shutdown { reason: 0 };
         assert!(state.is_shutdown());

@@ -6,6 +6,6 @@ license.workspace = true
 description = "Klipper MCU protocol framework for embedded Rust"
 
 [dependencies]
-anchor.workspace = true
+ankyra.workspace = true
 defmt.workspace = true
 heapless.workspace = true
