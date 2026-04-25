@@ -1,11 +1,12 @@
 [package]
 name = "foci-klipper"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
+edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Klipper MCU protocol framework for embedded Rust"
+repository = "https://github.com/foci-rs/foci-klipper"
 
 [dependencies]
-ankyra.workspace = true
-defmt.workspace = true
-heapless.workspace = true
+ankyra = { git = "https://github.com/foci-rs/ankyra" }
+defmt = "1.0"
+heapless = { version = "0.9", features = ["defmt"] }
