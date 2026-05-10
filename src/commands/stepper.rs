@@ -23,6 +23,17 @@ pub fn config_stepper(state: &mut State, oid: u8) -> Result<(), CommandError> {
     Ok(())
 }
 
+/// Register a stepper motor object and store its board-local channel.
+pub fn config_stepper_channel(state: &mut State, oid: u8, channel: u8) -> Result<(), CommandError> {
+    config_stepper(state, oid)?;
+    let idx = *state
+        .steppers_by_oid
+        .get(&oid)
+        .ok_or(CommandError::UnknownOid(oid))?;
+    state.stepper_channels[idx] = Some(channel);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Hardware step/dir command helpers
 // ---------------------------------------------------------------------------
@@ -130,6 +141,13 @@ mod tests {
             assert!(config_stepper(&mut state, i).is_ok());
         }
         assert_eq!(config_stepper(&mut state, 99), Err(CommandError::SlotsFull));
+    }
+
+    #[test]
+    fn config_stepper_channel_stores_channel() {
+        let mut state = State::new();
+        assert_eq!(config_stepper_channel(&mut state, 5, 1), Ok(()));
+        assert_eq!(state.stepper_channel(5), Some(1));
     }
 
     // --- Hardware step/dir command tests ---

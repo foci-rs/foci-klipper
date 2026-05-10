@@ -5,10 +5,25 @@ use heapless::LinearMap;
 
 /// Number of stepper objects supported.
 pub const NUM_STEPPERS: usize = 4;
+/// Number of FOCI motor bindings supported.
+pub const NUM_FOCI_MOTORS: usize = NUM_STEPPERS;
 /// Number of TrSync objects supported.
 pub const NUM_TRSYNC: usize = 4;
 /// Number of endstop objects supported.
 pub const NUM_ENDSTOPS: usize = 4;
+
+/// Config-time binding between a FOCI driver OID and a TMC4671 channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct FociMotorBinding {
+    /// Klipper OID for the FOCI TMC driver object.
+    pub oid: u8,
+    /// Klipper OID for the associated stepper object.
+    pub stepper_oid: u8,
+    /// Klipper OID for the associated enable object, when one is configured.
+    pub enable_oid: Option<u8>,
+    /// Board-local TMC4671 channel index.
+    pub channel: u8,
+}
 
 /// MCU application state.
 ///
@@ -27,6 +42,14 @@ pub struct State {
     pub steppers_by_oid: LinearMap<u8, usize, NUM_STEPPERS>,
     /// Map from digital output OID to stepper array index (for enable/disable).
     pub enable_by_oid: LinearMap<u8, usize, NUM_STEPPERS>,
+    /// Channel derived from each configured stepper's virtual STEP/DIR pins.
+    pub stepper_channels: [Option<u8>; NUM_STEPPERS],
+    /// Channel derived from each configured digital output's virtual enable pin.
+    pub enable_channels: [Option<u8>; NUM_STEPPERS],
+    /// Map from FOCI OID to binding array index.
+    pub foci_by_oid: LinearMap<u8, usize, NUM_FOCI_MOTORS>,
+    /// Config-time FOCI driver bindings.
+    pub foci_bindings: [Option<FociMotorBinding>; NUM_FOCI_MOTORS],
 }
 
 impl State {
@@ -37,7 +60,35 @@ impl State {
             config_crc: None,
             steppers_by_oid: LinearMap::new(),
             enable_by_oid: LinearMap::new(),
+            stepper_channels: [None; NUM_STEPPERS],
+            enable_channels: [None; NUM_STEPPERS],
+            foci_by_oid: LinearMap::new(),
+            foci_bindings: [None; NUM_FOCI_MOTORS],
         }
+    }
+
+    /// Return the configured channel for a stepper OID.
+    pub fn stepper_channel(&self, oid: u8) -> Option<u8> {
+        let idx = *self.steppers_by_oid.get(&oid)?;
+        self.stepper_channels[idx]
+    }
+
+    /// Return the configured channel for a digital-output enable OID.
+    pub fn enable_channel(&self, oid: u8) -> Option<u8> {
+        let idx = *self.enable_by_oid.get(&oid)?;
+        self.enable_channels[idx]
+    }
+
+    /// Return the configured channel for a FOCI driver OID.
+    pub fn foci_channel_for_oid(&self, oid: u8) -> Option<u8> {
+        let idx = *self.foci_by_oid.get(&oid)?;
+        self.foci_bindings[idx].map(|binding| binding.channel)
+    }
+
+    /// Return the configured FOCI motor binding for a FOCI driver OID.
+    pub fn foci_binding_for_oid(&self, oid: u8) -> Option<FociMotorBinding> {
+        let idx = *self.foci_by_oid.get(&oid)?;
+        self.foci_bindings[idx]
     }
 
     /// Reset all state for reconfiguration (after shutdown recovery).
@@ -46,6 +97,10 @@ impl State {
         self.config_crc = None;
         self.steppers_by_oid.clear();
         self.enable_by_oid.clear();
+        self.stepper_channels = [None; NUM_STEPPERS];
+        self.enable_channels = [None; NUM_STEPPERS];
+        self.foci_by_oid.clear();
+        self.foci_bindings = [None; NUM_FOCI_MOTORS];
     }
 }
 
@@ -79,6 +134,18 @@ mod tests {
         state.config_crc = Some(0xDEAD);
         state.steppers_by_oid.insert(0, 0).unwrap();
         state.enable_by_oid.insert(1, 0).unwrap();
+        state.stepper_channels[0] = Some(0);
+        state.enable_channels[0] = Some(0);
+        state
+            .foci_by_oid
+            .insert(2, 0)
+            .expect("test foci map has capacity");
+        state.foci_bindings[0] = Some(FociMotorBinding {
+            oid: 2,
+            stepper_oid: 0,
+            enable_oid: Some(1),
+            channel: 0,
+        });
 
         state.reset();
 
@@ -86,6 +153,10 @@ mod tests {
         assert!(state.config_crc.is_none());
         assert!(state.steppers_by_oid.is_empty());
         assert!(state.enable_by_oid.is_empty());
+        assert_eq!(state.stepper_channels, [None; NUM_STEPPERS]);
+        assert_eq!(state.enable_channels, [None; NUM_STEPPERS]);
+        assert!(state.foci_by_oid.is_empty());
+        assert_eq!(state.foci_bindings, [None; NUM_FOCI_MOTORS]);
     }
 
     #[test]

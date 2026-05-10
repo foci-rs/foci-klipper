@@ -22,6 +22,17 @@ pub fn config_digital_out(state: &mut State, oid: u8) -> Result<(), CommandError
     Ok(())
 }
 
+/// Register a digital output object and store its board-local enable channel.
+pub fn config_enable_channel(state: &mut State, oid: u8, channel: u8) -> Result<(), CommandError> {
+    config_digital_out(state, oid)?;
+    let idx = *state
+        .enable_by_oid
+        .get(&oid)
+        .ok_or(CommandError::UnknownOid(oid))?;
+    state.enable_channels[idx] = Some(channel);
+    Ok(())
+}
+
 /// Schedule a digital output change (motor enable/disable).
 ///
 /// Returns `Ok(enabled)` where `enabled` indicates whether the motor
@@ -65,6 +76,13 @@ mod tests {
             config_digital_out(&mut state, 99),
             Err(CommandError::SlotsFull)
         );
+    }
+
+    #[test]
+    fn config_enable_channel_stores_channel() {
+        let mut state = State::new();
+        assert_eq!(config_enable_channel(&mut state, 5, 1), Ok(()));
+        assert_eq!(state.enable_channel(5), Some(1));
     }
 
     #[test]
