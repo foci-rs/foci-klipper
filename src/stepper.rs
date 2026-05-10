@@ -396,49 +396,6 @@ impl HardwareStepper {
 mod hardware_stepper_tests {
     use super::*;
 
-    /// Mock StepperPin for host-side testing.
-    struct MockPin {
-        step_count: u32,
-        direction: bool,
-        last_compare: u32,
-        compare_enabled: bool,
-        clock: u32,
-    }
-
-    impl MockPin {
-        fn new() -> Self {
-            Self {
-                step_count: 0,
-                direction: true,
-                last_compare: 0,
-                compare_enabled: false,
-                clock: 0,
-            }
-        }
-    }
-
-    impl StepperPin for MockPin {
-        fn step_toggle(&mut self) {
-            self.step_count += 1;
-        }
-        fn set_direction(&mut self, dir: bool) {
-            self.direction = dir;
-        }
-        fn schedule_compare(&mut self, clock: u32) {
-            self.last_compare = clock;
-            self.compare_enabled = true;
-        }
-        fn disable_compare_interrupt(&mut self) {
-            self.compare_enabled = false;
-        }
-        fn enable_compare_interrupt(&mut self) {
-            self.compare_enabled = true;
-        }
-        fn read_clock(&self) -> u32 {
-            self.clock
-        }
-    }
-
     #[test]
     fn prepare_move_sets_dir_changed() {
         let mut s = HardwareStepper::new();
