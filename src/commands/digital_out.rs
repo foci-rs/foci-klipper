@@ -24,6 +24,13 @@ pub fn config_digital_out(state: &mut State, oid: u8) -> Result<(), CommandError
 
 /// Register a digital output object and store its board-local enable channel.
 pub fn config_enable_channel(state: &mut State, oid: u8, channel: u8) -> Result<(), CommandError> {
+    if state.enable_by_oid.contains_key(&oid) {
+        return Err(CommandError::DuplicateOid(oid));
+    }
+    if state.enable_channels.contains(&Some(channel)) {
+        return Err(CommandError::ChannelInUse(channel));
+    }
+
     config_digital_out(state, oid)?;
     let idx = *state
         .enable_by_oid
@@ -83,6 +90,35 @@ mod tests {
         let mut state = State::new();
         assert_eq!(config_enable_channel(&mut state, 5, 1), Ok(()));
         assert_eq!(state.enable_channel(5), Some(1));
+    }
+
+    #[test]
+    fn config_enable_channel_duplicate_oid_takes_precedence_over_channel() {
+        let mut state = State::new();
+
+        assert_eq!(config_enable_channel(&mut state, 5, 1), Ok(()));
+        assert_eq!(
+            config_enable_channel(&mut state, 5, 1),
+            Err(CommandError::DuplicateOid(5))
+        );
+        assert_eq!(state.enable_by_oid.len(), 1);
+        assert_eq!(state.enable_channel(5), Some(1));
+    }
+
+    #[test]
+    fn config_enable_channel_rejects_duplicate_channel() {
+        let mut state = State::new();
+
+        assert_eq!(config_enable_channel(&mut state, 5, 1), Ok(()));
+        let registered_outputs = state.enable_by_oid.len();
+        assert_eq!(
+            config_enable_channel(&mut state, 6, 1),
+            Err(CommandError::ChannelInUse(1))
+        );
+        assert_eq!(state.enable_by_oid.len(), registered_outputs);
+        assert!(!state.enable_by_oid.contains_key(&6));
+        assert_eq!(state.enable_channel(5), Some(1));
+        assert_eq!(state.enable_channel(6), None);
     }
 
     #[test]

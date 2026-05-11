@@ -16,6 +16,10 @@ pub enum CommandError {
     UnknownOid(u8),
     /// OID already registered (duplicate config command).
     DuplicateOid(u8),
+    /// Board-local motor channel already has a configured owner.
+    ChannelInUse(u8),
+    /// Board-local motor channel is outside the board-supported range.
+    InvalidChannel(u8),
     /// No slots available for new object registration.
     SlotsFull,
     /// Move queue overflow.

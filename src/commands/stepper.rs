@@ -25,6 +25,13 @@ pub fn config_stepper(state: &mut State, oid: u8) -> Result<(), CommandError> {
 
 /// Register a stepper motor object and store its board-local channel.
 pub fn config_stepper_channel(state: &mut State, oid: u8, channel: u8) -> Result<(), CommandError> {
+    if state.steppers_by_oid.contains_key(&oid) {
+        return Err(CommandError::DuplicateOid(oid));
+    }
+    if state.stepper_channels.contains(&Some(channel)) {
+        return Err(CommandError::ChannelInUse(channel));
+    }
+
     config_stepper(state, oid)?;
     let idx = *state
         .steppers_by_oid
@@ -148,6 +155,46 @@ mod tests {
         let mut state = State::new();
         assert_eq!(config_stepper_channel(&mut state, 5, 1), Ok(()));
         assert_eq!(state.stepper_channel(5), Some(1));
+    }
+
+    #[test]
+    fn config_stepper_channel_duplicate_oid_takes_precedence_over_channel() {
+        let mut state = State::new();
+
+        assert_eq!(config_stepper_channel(&mut state, 5, 1), Ok(()));
+        assert_eq!(
+            config_stepper_channel(&mut state, 5, 1),
+            Err(CommandError::DuplicateOid(5))
+        );
+        assert_eq!(state.steppers_by_oid.len(), 1);
+        assert_eq!(state.stepper_channel(5), Some(1));
+    }
+
+    #[test]
+    fn config_stepper_channel_rejects_duplicate_channel() {
+        let mut state = State::new();
+
+        assert_eq!(config_stepper_channel(&mut state, 5, 1), Ok(()));
+        let registered_steppers = state.steppers_by_oid.len();
+        assert_eq!(
+            config_stepper_channel(&mut state, 6, 1),
+            Err(CommandError::ChannelInUse(1))
+        );
+        assert_eq!(state.steppers_by_oid.len(), registered_steppers);
+        assert!(!state.steppers_by_oid.contains_key(&6));
+        assert_eq!(state.stepper_channel(5), Some(1));
+        assert_eq!(state.stepper_channel(6), None);
+    }
+
+    #[test]
+    fn config_stepper_channel_allows_distinct_channels() {
+        let mut state = State::new();
+
+        assert_eq!(config_stepper_channel(&mut state, 5, 0), Ok(()));
+        assert_eq!(config_stepper_channel(&mut state, 6, 1), Ok(()));
+
+        assert_eq!(state.stepper_channel(5), Some(0));
+        assert_eq!(state.stepper_channel(6), Some(1));
     }
 
     // --- Hardware step/dir command tests ---
