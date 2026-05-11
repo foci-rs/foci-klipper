@@ -5,7 +5,6 @@
 //! `klipper_reply!`, `klipper_shutdown!`, and hardware I/O.
 
 pub mod digital_out;
-pub mod foci;
 pub mod lifecycle;
 pub mod spi;
 pub mod stepper;
@@ -25,24 +24,6 @@ pub enum CommandError {
     StepperActive,
     /// Zero-count move rejected.
     ZeroCount,
-    /// Configured channel is outside the board's supported channel range.
-    InvalidChannel {
-        /// Requested channel.
-        channel: u8,
-        /// Number of channels supported by the board.
-        channel_count: u8,
-    },
-    /// Stepper OID is already owned by a FOCI binding.
-    DuplicateStepper(u8),
-    /// TMC4671 channel is already owned by a FOCI binding.
-    DuplicateChannel(u8),
-    /// Configured FOCI channel does not match the stepper's channel.
-    ChannelMismatch {
-        /// Stepper OID whose configured channel was checked.
-        stepper_oid: u8,
-        /// Requested FOCI channel.
-        channel: u8,
-    },
 }
 
 /// Returned by [`lifecycle::clear_shutdown`] when called outside shutdown state.
