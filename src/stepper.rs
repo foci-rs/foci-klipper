@@ -217,6 +217,17 @@ impl HardwareStepper {
         self.was_active = false;
     }
 
+    /// Mark the stepper idle after the move queue is observed empty.
+    ///
+    /// Klipper's `stepper_load_next()` can tell the difference between a
+    /// contiguous segment transition and an empty queue because the final
+    /// unstep calls it before clearing `count`. This split Rust
+    /// implementation returns `NeedMove` after decrementing the event count,
+    /// so the board ISR must explicitly call this when the queue is empty.
+    pub fn mark_idle(&mut self) {
+        self.was_active = false;
+    }
+
     // --- P3 methods (timer ISR) ---
 
     /// Load a move segment from the queue into the active segment.
@@ -283,6 +294,7 @@ impl HardwareStepper {
             // Unstep phase.
             if self.current_count == 0 {
                 // Final unstep of this segment — segment exhausted.
+                self.was_active = true;
                 return StepEventResult::NeedMove;
             }
             // Advance interval by acceleration (clamped to ≥ 1), then
@@ -305,9 +317,14 @@ impl HardwareStepper {
     /// Check if the scheduled step time has passed acceptable bounds.
     ///
     /// Matches Klipper `stepper_load_next()` missed-deadline logic:
-    /// - `was_active = false` (first activation): no check, return Ok(clock)
+    /// - `was_active = false` (first activation): no shutdown check
     /// - `was_active = true` and >1ms past: return Err (caller shuts down)
     /// - `was_active = true` and 0-1ms past: nudge to `now + min_ticks`
+    ///
+    /// If this returns an adjusted immediate clock, callers must schedule that
+    /// compare without rebasing `next_step_clock`. Klipper keeps the original
+    /// cadence anchor so a stepper that briefly runs dry can catch up to the
+    /// host schedule once more queue entries arrive.
     ///
     /// `clock_freq` is the timer frequency (84 MHz for TIM5). The 1ms
     /// threshold is `clock_freq / 1000`.
@@ -356,31 +373,6 @@ impl HardwareStepper {
         self.next_step_clock
     }
 
-    /// Rebase the active segment clock after a missed-deadline nudge.
-    ///
-    /// `check_deadline()` may return an adjusted immediate clock when the
-    /// scheduled step is already in the past. If the caller executes at that
-    /// adjusted time, the internal schedule must also move to that adjusted
-    /// time so subsequent steps keep their requested spacing instead of
-    /// remaining anchored to a stale clock.
-    ///
-    /// **Full-mode caveat:** this only applies when the nudged clock
-    /// represents the next *rising edge* cadence anchor — i.e. when the
-    /// most recent `step_event()` returned `StepPhase::Unstep` or before
-    /// the first step of a freshly-loaded segment. Never rebase with the
-    /// unstep (pulse-close) clock returned after a `StepPhase::Step`
-    /// event: that clock is only a few pulse ticks past the rising edge
-    /// and is almost always already in the past by the time the ISR
-    /// reads it, which would pull the cadence anchor forward by the
-    /// pulse-close latency on every step and stretch the effective step
-    /// interval. The ISR handles this by firing the unstep immediately
-    /// without rebasing; the following `StepPhase::Unstep` event then
-    /// schedules the next rising edge correctly from the original step
-    /// clock.
-    pub fn rebase_next_step_clock(&mut self, clock: u32) {
-        self.next_step_clock = clock;
-    }
-
     /// Returns the current DIR state.
     pub fn dir_state(&self) -> bool {
         self.dir_state
@@ -389,6 +381,15 @@ impl HardwareStepper {
     /// Returns whether the active segment has steps remaining.
     pub fn has_active_segment(&self) -> bool {
         self.current_count > 0
+    }
+
+    /// Remaining timer events in the active segment.
+    ///
+    /// Full-mode stepping uses two timer events per motor step, so this
+    /// value is twice the remaining motor-step count except when stopped
+    /// between a rising and falling edge.
+    pub fn active_event_count(&self) -> u32 {
+        self.current_count
     }
 }
 
@@ -844,10 +845,11 @@ mod hardware_stepper_tests {
     }
 
     #[test]
-    fn rebase_next_step_clock_preserves_spacing_after_nudge() {
-        // After a missed-deadline nudge, rebase_next_step_clock updates the
-        // internal reference so the subsequent step/unstep pair lands at
-        // correct offsets from the nudged time (not from the stale original).
+    fn past_deadline_nudge_preserves_cadence_anchor() {
+        // Klipper fires late events as soon as possible, but does not rebase
+        // next_step_time. Keeping the stale cadence anchor is important after
+        // a queue underrun: it lets the stepper catch up to the host schedule
+        // instead of carrying the late arrival forward as permanent lag.
         let mut s = HardwareStepper::new();
         s.reset_step_clock(0);
 
@@ -859,24 +861,72 @@ mod hardware_stepper_tests {
 
         let adjusted = s.check_deadline(s.next_step_clock(), 1000, 84_000_000);
         assert_eq!(adjusted, Ok(1002));
-        s.rebase_next_step_clock(1002);
 
-        // Step 1 rising (at rebased clock 1002): schedule unstep at
-        // 1002 + STEP_PULSE_TICKS.
+        // Step 1 rising was executed late, but the unstep is still anchored
+        // to the original first step time.
         assert_eq!(
             s.step_event(),
             StepEventResult::ScheduleNext {
-                clock: 1002 + STEP_PULSE_TICKS,
+                clock: 100 + STEP_PULSE_TICKS,
                 phase: StepPhase::Step,
             }
         );
-        // Step 1 falling: next step at rebased 1002 + interval(100) = 1102.
+        // Step 1 falling keeps advancing from the original cadence anchor.
         assert_eq!(
             s.step_event(),
             StepEventResult::ScheduleNext {
-                clock: 1102,
+                clock: 200,
                 phase: StepPhase::Unstep,
             }
+        );
+    }
+
+    #[test]
+    fn contiguous_segment_load_keeps_active_deadline_checks() {
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+
+        s.load_move(StepMove::new(100, 1, 0));
+        assert_eq!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                clock: 100 + STEP_PULSE_TICKS,
+                phase: StepPhase::Step,
+            }
+        );
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
+
+        s.load_move(StepMove::new(100, 1, 0));
+        assert_eq!(s.next_step_clock(), 200);
+
+        // The second segment is contiguous with the just-finished segment.
+        // Klipper's stepper_load_next() sees the previous count as still
+        // active in this path, so a segment that is more than 1ms late must
+        // trip the missed-deadline check instead of being treated as a fresh
+        // idle activation.
+        assert_eq!(
+            s.check_deadline(200, 200 + 100_000, 84_000_000),
+            Err(MissedDeadline)
+        );
+    }
+
+    #[test]
+    fn queue_empty_marks_next_segment_idle() {
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+
+        s.load_move(StepMove::new(100, 1, 0));
+        s.step_event();
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
+        s.mark_idle();
+
+        s.load_move(StepMove::new(100, 1, 0));
+
+        // After the queue actually went empty, the next queued segment is a
+        // new activation and follows Klipper's no-check first-load behavior.
+        assert_eq!(
+            s.check_deadline(200, 200 + 100_000, 84_000_000),
+            Ok(100_202)
         );
     }
 }
