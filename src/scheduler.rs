@@ -1,22 +1,23 @@
-//! Software timer scheduler for endstop and trsync events.
+//! Software timer scheduler for Klipper-clock events.
 //!
 //! Manages a fixed-capacity event table driven by one hardware compare
-//! channel (TIM5 CC2). All clock comparisons use signed 32-bit wraparound.
+//! channel. All clock comparisons use signed 32-bit wraparound.
 
-/// Maximum scheduler events: NUM_ENDSTOPS + 2 * NUM_TRSYNC.
-/// With 4 endstops and 4 trsync = 4 + 8 = 12.
-pub const MAX_SCHEDULER_EVENTS: usize = 12;
+/// Maximum scheduler events: NUM_STEPPERS + NUM_ENDSTOPS + 2 * NUM_TRSYNC.
+/// With 1 physical stepper, 4 endstops, and 4 trsync = 1 + 4 + 8 = 13.
+pub const MAX_SCHEDULER_EVENTS: usize = 13;
 
 /// Scheduler event kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerEventKind {
+    Stepper(usize),
     EndstopSample(usize),
     TrSyncExpire(usize),
     TrSyncReport(usize),
 }
 
 /// A scheduled event.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerEvent {
     pub kind: SchedulerEventKind,
     pub wake_clock: u32,
@@ -106,6 +107,36 @@ impl TriggerScheduler {
             }
         }
         due
+    }
+
+    /// Remove and return the earliest due event.
+    ///
+    /// If multiple events are due at `now`, this follows the same ordering
+    /// used by [`earliest_deadline`], so callers can repeatedly pop until it
+    /// returns `None` and process all ready work in scheduler order.
+    pub fn pop_due(&mut self, now: u32) -> Option<SchedulerEvent> {
+        let mut earliest_index: Option<usize> = None;
+        let mut earliest_clock: Option<u32> = None;
+        for (index, slot) in self.events.iter().enumerate() {
+            let Some(event) = slot else {
+                continue;
+            };
+            let due_delta = now.wrapping_sub(event.wake_clock) as i32;
+            if due_delta < 0 {
+                continue;
+            }
+            if earliest_clock.is_none_or(|earliest| {
+                let delta = event.wake_clock.wrapping_sub(earliest) as i32;
+                delta < 0
+            }) {
+                earliest_index = Some(index);
+                earliest_clock = Some(event.wake_clock);
+            }
+        }
+        let index = earliest_index?;
+        let event = self.events[index];
+        self.events[index] = None;
+        event
     }
 
     /// Get event at index (for processing).
@@ -284,5 +315,99 @@ mod tests {
             wake_clock: 4000,
         });
         assert!(!is_earliest); // not earlier than 3000
+    }
+
+    #[test]
+    fn pop_due_processes_stepper_and_trigger_events_in_clock_order() {
+        let mut s = TriggerScheduler::new();
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::EndstopSample(0),
+            wake_clock: 1100,
+        });
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::Stepper(0),
+            wake_clock: 1000,
+        });
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::TrSyncReport(0),
+            wake_clock: 1050,
+        });
+
+        assert_eq!(
+            s.pop_due(1200),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 1000,
+            })
+        );
+        assert_eq!(
+            s.pop_due(1200),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 1050,
+            })
+        );
+        assert_eq!(
+            s.pop_due(1200),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 1100,
+            })
+        );
+        assert_eq!(s.pop_due(1200), None);
+    }
+
+    #[test]
+    fn pop_due_respects_wraparound_clock_order() {
+        let mut s = TriggerScheduler::new();
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::EndstopSample(0),
+            wake_clock: 0x0000_0040,
+        });
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::Stepper(0),
+            wake_clock: 0xFFFF_FFF0,
+        });
+
+        assert_eq!(
+            s.pop_due(0x0000_0080),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 0xFFFF_FFF0,
+            })
+        );
+        assert_eq!(
+            s.pop_due(0x0000_0080),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 0x0000_0040,
+            })
+        );
+        assert_eq!(s.pop_due(0x0000_0080), None);
+    }
+
+    #[test]
+    fn cancel_removes_stale_stepper_event_without_clearing_triggers() {
+        let mut s = TriggerScheduler::new();
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::Stepper(0),
+            wake_clock: 1000,
+        });
+        s.schedule(SchedulerEvent {
+            kind: SchedulerEventKind::TrSyncExpire(0),
+            wake_clock: 1200,
+        });
+
+        let cancelled = s.cancel(|kind| matches!(kind, SchedulerEventKind::Stepper(0)));
+
+        assert_eq!(cancelled, 1);
+        assert_eq!(
+            s.pop_due(1300),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncExpire(0),
+                wake_clock: 1200,
+            })
+        );
+        assert_eq!(s.pop_due(1300), None);
     }
 }
