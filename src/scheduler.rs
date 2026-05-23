@@ -23,6 +23,21 @@ pub struct SchedulerEvent {
     pub wake_clock: u32,
 }
 
+/// Return the hardware compare clock to arm for a scheduler deadline.
+///
+/// If `deadline` is farther than `min_lead_ticks` in the future, callers can
+/// arm the hardware timer at the exact deadline. If it is already due or too
+/// close to arm reliably, this returns `now + min_lead_ticks` instead. The
+/// comparison uses signed 32-bit wraparound semantics for Klipper clocks.
+pub fn timer_arm_clock(now: u32, deadline: u32, min_lead_ticks: u32) -> u32 {
+    let delta = deadline.wrapping_sub(now) as i32;
+    if delta <= min_lead_ticks as i32 {
+        now.wrapping_add(min_lead_ticks)
+    } else {
+        deadline
+    }
+}
+
 /// Software scheduler over a fixed event table.
 pub struct TriggerScheduler {
     events: [Option<SchedulerEvent>; MAX_SCHEDULER_EVENTS],
@@ -409,5 +424,26 @@ mod tests {
             })
         );
         assert_eq!(s.pop_due(1300), None);
+    }
+
+    #[test]
+    fn timer_arm_clock_keeps_safe_future_deadline() {
+        assert_eq!(timer_arm_clock(1000, 1200, 128), 1200);
+    }
+
+    #[test]
+    fn timer_arm_clock_clamps_near_future_deadline() {
+        assert_eq!(timer_arm_clock(1000, 1050, 128), 1128);
+    }
+
+    #[test]
+    fn timer_arm_clock_clamps_past_deadline() {
+        assert_eq!(timer_arm_clock(1000, 990, 128), 1128);
+    }
+
+    #[test]
+    fn timer_arm_clock_handles_wraparound_deadline() {
+        assert_eq!(timer_arm_clock(0xFFFF_FF00, 0x0000_0010, 128), 0x0000_0010);
+        assert_eq!(timer_arm_clock(0xFFFF_FF00, 0xFFFF_FF10, 128), 0xFFFF_FF80);
     }
 }
