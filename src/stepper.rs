@@ -251,6 +251,33 @@ impl HardwareStepper {
         m.dir_changed
     }
 
+    /// Return the phase of the next full-mode timer event.
+    ///
+    /// Full-pulse scheduling stores two events per motor step. Before
+    /// `step_event()` decrements the count, an even count means the next event
+    /// is a rising edge and an odd count means the next event is a falling edge.
+    pub fn next_event_phase(&self) -> Option<StepPhase> {
+        if self.current_count == 0 {
+            return None;
+        }
+        if self.current_count & 1 == 0 {
+            Some(StepPhase::Step)
+        } else {
+            Some(StepPhase::Unstep)
+        }
+    }
+
+    /// Clamp an event-level deadline to the minimum safe compare time.
+    ///
+    /// This mirrors Klipper C `stepper_event_full()` `reschedule_min`: a
+    /// full-mode event that is late or too close is pushed to `now + min_ticks`
+    /// instead of using the segment-load missed-deadline policy.
+    pub fn clamp_event_deadline(&self, scheduled: u32, now: u32, min_ticks: u32) -> u32 {
+        let min_clock = now.wrapping_add(min_ticks);
+        let delta = scheduled.wrapping_sub(min_clock) as i32;
+        if delta < 0 { min_clock } else { scheduled }
+    }
+
     /// Execute one timer event and advance scheduling.
     ///
     /// Called from the P3 timer ISR after toggling the STEP GPIO. Returns
@@ -413,6 +440,84 @@ mod hardware_stepper_tests {
         // Same (now false): no change.
         let m = s.prepare_move(StepMove::new(100, 5, 0));
         assert!(!m.dir_changed);
+    }
+
+    #[test]
+    fn event_deadline_late_clamps_without_missed_deadline() {
+        let mut s = HardwareStepper::new();
+        s.was_active = true;
+
+        let now = 200_000;
+        let scheduled = now - 100_000;
+
+        assert_eq!(
+            s.clamp_event_deadline(scheduled, now, STEP_PULSE_TICKS),
+            now + STEP_PULSE_TICKS
+        );
+    }
+
+    #[test]
+    fn event_deadline_too_close_clamps_to_minimum_time() {
+        let s = HardwareStepper::new();
+
+        let now = 10_000;
+        let scheduled = now + 3;
+
+        assert_eq!(
+            s.clamp_event_deadline(scheduled, now, STEP_PULSE_TICKS),
+            now + STEP_PULSE_TICKS
+        );
+    }
+
+    #[test]
+    fn event_deadline_future_clock_is_preserved() {
+        let s = HardwareStepper::new();
+
+        let now = 10_000;
+        let scheduled = now + 100;
+
+        assert_eq!(
+            s.clamp_event_deadline(scheduled, now, STEP_PULSE_TICKS),
+            scheduled
+        );
+    }
+
+    #[test]
+    fn next_event_phase_matches_full_pulse_count_parity() {
+        let mut s = HardwareStepper::new();
+        s.reset_step_clock(0);
+        s.load_move(StepMove::new(100, 2, 0));
+
+        assert_eq!(s.next_event_phase(), Some(StepPhase::Step));
+        assert!(matches!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                phase: StepPhase::Step,
+                ..
+            }
+        ));
+
+        assert_eq!(s.next_event_phase(), Some(StepPhase::Unstep));
+        assert!(matches!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                phase: StepPhase::Unstep,
+                ..
+            }
+        ));
+
+        assert_eq!(s.next_event_phase(), Some(StepPhase::Step));
+        assert!(matches!(
+            s.step_event(),
+            StepEventResult::ScheduleNext {
+                phase: StepPhase::Step,
+                ..
+            }
+        ));
+
+        assert_eq!(s.next_event_phase(), Some(StepPhase::Unstep));
+        assert_eq!(s.step_event(), StepEventResult::NeedMove);
+        assert_eq!(s.next_event_phase(), None);
     }
 
     #[test]
