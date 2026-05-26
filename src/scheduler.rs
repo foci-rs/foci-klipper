@@ -23,6 +23,15 @@ pub struct SchedulerEvent {
     pub wake_clock: u32,
 }
 
+/// Result of inserting a scheduler event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScheduleResult {
+    /// Event was inserted. `new_earliest` means hardware compare must move.
+    Inserted { new_earliest: bool },
+    /// The fixed scheduler table had no free slot.
+    Full,
+}
+
 /// Return the hardware compare clock to arm for a scheduler deadline.
 ///
 /// If `deadline` is farther than `min_lead_ticks` in the future, callers can
@@ -61,22 +70,29 @@ impl TriggerScheduler {
         self.cc2_active = active;
     }
 
-    /// Schedule an event. Returns true if this is the new earliest deadline
-    /// (caller should reprogram CC2).
-    pub fn schedule(&mut self, event: SchedulerEvent) -> bool {
+    /// Schedule an event with explicit full-table reporting.
+    pub fn try_schedule(&mut self, event: SchedulerEvent) -> ScheduleResult {
         // Find empty slot index first so we can call earliest_deadline() without
         // holding a mutable reference into self.events at the same time.
         let slot_index = self.events.iter().position(|e| e.is_none());
         if let Some(index) = slot_index {
-            let was_earliest = self.earliest_deadline().is_none_or(|earliest| {
+            let new_earliest = self.earliest_deadline().is_none_or(|earliest| {
                 let delta = event.wake_clock.wrapping_sub(earliest) as i32;
                 delta < 0 // new event is earlier
             });
             self.events[index] = Some(event);
-            was_earliest
+            ScheduleResult::Inserted { new_earliest }
         } else {
             // Table full — should not happen with correct capacity
-            false
+            ScheduleResult::Full
+        }
+    }
+
+    /// Schedule an event. Temporary compatibility wrapper for migration only.
+    pub fn schedule(&mut self, event: SchedulerEvent) -> bool {
+        match self.try_schedule(event) {
+            ScheduleResult::Inserted { new_earliest } => new_earliest,
+            ScheduleResult::Full => false,
         }
     }
 
@@ -195,6 +211,13 @@ impl Default for TriggerScheduler {
 mod tests {
     use super::*;
 
+    fn insert(scheduler: &mut TriggerScheduler, event: SchedulerEvent) {
+        assert!(matches!(
+            scheduler.try_schedule(event),
+            ScheduleResult::Inserted { .. }
+        ));
+    }
+
     #[test]
     fn new_scheduler_empty() {
         let s = TriggerScheduler::new();
@@ -205,7 +228,7 @@ mod tests {
     #[test]
     fn schedule_and_find_due() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 1000,
         });
@@ -219,11 +242,11 @@ mod tests {
     #[test]
     fn earliest_deadline_correct() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncExpire(0),
             wake_clock: 5000,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 2000,
         });
@@ -233,15 +256,15 @@ mod tests {
     #[test]
     fn cancel_by_kind() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncExpire(0),
             wake_clock: 1000,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncReport(0),
             wake_clock: 2000,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(1),
             wake_clock: 3000,
         });
@@ -258,7 +281,7 @@ mod tests {
     #[test]
     fn wraparound_due_check() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 0xFFFF_FF00,
         });
@@ -270,11 +293,11 @@ mod tests {
     #[test]
     fn wraparound_earliest_deadline() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 0x0000_0100,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncExpire(0),
             wake_clock: 0xFFFF_FF00,
         });
@@ -285,7 +308,7 @@ mod tests {
     #[test]
     fn reschedule_updates_clock() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncReport(0),
             wake_clock: 1000,
         });
@@ -301,7 +324,7 @@ mod tests {
     #[test]
     fn clear_removes_all() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 1000,
         });
@@ -311,39 +334,67 @@ mod tests {
     }
 
     #[test]
-    fn schedule_returns_true_when_new_earliest() {
+    fn try_schedule_reports_new_earliest() {
         let mut s = TriggerScheduler::new();
-        let is_earliest = s.schedule(SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 5000,
-        });
-        assert!(is_earliest); // first event is always earliest
+        assert_eq!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 5000,
+            }),
+            ScheduleResult::Inserted { new_earliest: true }
+        );
+        assert_eq!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(1),
+                wake_clock: 3000,
+            }),
+            ScheduleResult::Inserted { new_earliest: true }
+        );
+        assert_eq!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncExpire(0),
+                wake_clock: 4000,
+            }),
+            ScheduleResult::Inserted {
+                new_earliest: false,
+            }
+        );
+    }
 
-        let is_earliest = s.schedule(SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(1),
-            wake_clock: 3000,
-        });
-        assert!(is_earliest); // earlier than 5000
+    #[test]
+    fn try_schedule_returns_full_when_table_is_full() {
+        let mut s = TriggerScheduler::new();
+        for idx in 0..MAX_SCHEDULER_EVENTS {
+            assert!(matches!(
+                s.try_schedule(SchedulerEvent {
+                    kind: SchedulerEventKind::EndstopSample(idx),
+                    wake_clock: idx as u32,
+                }),
+                ScheduleResult::Inserted { .. }
+            ));
+        }
 
-        let is_earliest = s.schedule(SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncExpire(0),
-            wake_clock: 4000,
-        });
-        assert!(!is_earliest); // not earlier than 3000
+        assert_eq!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 100,
+            }),
+            ScheduleResult::Full
+        );
     }
 
     #[test]
     fn pop_due_processes_stepper_and_trigger_events_in_clock_order() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 1100,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::Stepper(0),
             wake_clock: 1000,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncReport(0),
             wake_clock: 1050,
         });
@@ -375,11 +426,11 @@ mod tests {
     #[test]
     fn pop_due_respects_wraparound_clock_order() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::EndstopSample(0),
             wake_clock: 0x0000_0040,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::Stepper(0),
             wake_clock: 0xFFFF_FFF0,
         });
@@ -404,11 +455,11 @@ mod tests {
     #[test]
     fn cancel_removes_stale_stepper_event_without_clearing_triggers() {
         let mut s = TriggerScheduler::new();
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::Stepper(0),
             wake_clock: 1000,
         });
-        s.schedule(SchedulerEvent {
+        insert(&mut s, SchedulerEvent {
             kind: SchedulerEventKind::TrSyncExpire(0),
             wake_clock: 1200,
         });
