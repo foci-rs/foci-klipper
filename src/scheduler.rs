@@ -7,6 +7,8 @@
 /// With 1 physical stepper, 4 endstops, and 4 trsync = 1 + 4 + 8 = 13.
 pub const MAX_SCHEDULER_EVENTS: usize = 13;
 
+const NIL: u8 = u8::MAX;
+
 /// Scheduler event kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchedulerEventKind {
@@ -21,6 +23,12 @@ pub enum SchedulerEventKind {
 pub struct SchedulerEvent {
     pub kind: SchedulerEventKind,
     pub wake_clock: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScheduledNode {
+    event: SchedulerEvent,
+    next: u8,
 }
 
 /// Result of inserting a scheduler event.
@@ -47,9 +55,31 @@ pub fn timer_arm_clock(now: u32, deadline: u32, min_lead_ticks: u32) -> u32 {
     }
 }
 
-/// Software scheduler over a fixed event table.
+fn is_due(now: u32, wake_clock: u32) -> bool {
+    (now.wrapping_sub(wake_clock) as i32) >= 0
+}
+
+fn is_before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+fn is_before_or_equal(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) <= 0
+}
+
+/// Single-owner, externally synchronized timer queue.
+///
+/// All mutation must hold the trigger-domain lock (`with_trigger_domain_site`
+/// on OpenFFBoard, equivalent on other boards). No internal atomics; no `Sync`
+/// guarantee beyond the lock.
+///
+/// Invariants:
+/// - `head == NIL` means the queue is empty.
+/// - A slot is either `None` and free, or `Some` and reachable from `head`.
+/// - There are no orphan `Some` nodes outside the `head` chain.
 pub struct TriggerScheduler {
-    events: [Option<SchedulerEvent>; MAX_SCHEDULER_EVENTS],
+    nodes: [Option<ScheduledNode>; MAX_SCHEDULER_EVENTS],
+    head: u8,
     /// Whether the hardware compare (CC2) is currently enabled.
     cc2_active: bool,
 }
@@ -57,7 +87,8 @@ pub struct TriggerScheduler {
 impl TriggerScheduler {
     pub const fn new() -> Self {
         Self {
-            events: [None; MAX_SCHEDULER_EVENTS],
+            nodes: [None; MAX_SCHEDULER_EVENTS],
+            head: NIL,
             cc2_active: false,
         }
     }
@@ -70,66 +101,100 @@ impl TriggerScheduler {
         self.cc2_active = active;
     }
 
+    fn insert_node(&mut self, index: u8, event: SchedulerEvent) -> bool {
+        let old_head = self.head;
+        self.nodes[index as usize] = Some(ScheduledNode { event, next: NIL });
+
+        if self.head == NIL {
+            self.head = index;
+            return true;
+        }
+
+        let head_event = self.nodes[self.head as usize]
+            .as_ref()
+            .expect("head node exists")
+            .event;
+        if is_before(event.wake_clock, head_event.wake_clock) {
+            self.nodes[index as usize]
+                .as_mut()
+                .expect("inserted node exists")
+                .next = self.head;
+            self.head = index;
+            return true;
+        }
+
+        let mut prev = self.head;
+        let mut next = self.nodes[prev as usize]
+            .as_ref()
+            .expect("linked node exists")
+            .next;
+        while next != NIL {
+            let next_node = self.nodes[next as usize]
+                .as_ref()
+                .expect("linked node exists");
+            if !is_before_or_equal(next_node.event.wake_clock, event.wake_clock) {
+                break;
+            }
+            prev = next;
+            next = next_node.next;
+        }
+
+        self.nodes[index as usize]
+            .as_mut()
+            .expect("inserted node exists")
+            .next = next;
+        self.nodes[prev as usize]
+            .as_mut()
+            .expect("previous node exists")
+            .next = index;
+        old_head != self.head
+    }
+
     /// Schedule an event with explicit full-table reporting.
     pub fn try_schedule(&mut self, event: SchedulerEvent) -> ScheduleResult {
-        // Find empty slot index first so we can call earliest_deadline() without
-        // holding a mutable reference into self.events at the same time.
-        let slot_index = self.events.iter().position(|e| e.is_none());
-        if let Some(index) = slot_index {
-            let new_earliest = self.earliest_deadline().is_none_or(|earliest| {
-                let delta = event.wake_clock.wrapping_sub(earliest) as i32;
-                delta < 0 // new event is earlier
-            });
-            self.events[index] = Some(event);
-            ScheduleResult::Inserted { new_earliest }
-        } else {
-            // Table full — should not happen with correct capacity
-            ScheduleResult::Full
-        }
+        let Some(index) = self.nodes.iter().position(|node| node.is_none()) else {
+            return ScheduleResult::Full;
+        };
+        let new_earliest = self.insert_node(index as u8, event);
+        ScheduleResult::Inserted { new_earliest }
     }
 
     /// Cancel all events matching a filter. Returns number cancelled.
     pub fn cancel<F: Fn(&SchedulerEventKind) -> bool>(&mut self, filter: F) -> usize {
         let mut count = 0;
-        for slot in self.events.iter_mut() {
-            if let Some(event) = slot
-                && filter(&event.kind)
-            {
-                *slot = None;
+        let mut prev = NIL;
+        let mut current = self.head;
+
+        while current != NIL {
+            let node = self.nodes[current as usize].expect("linked node exists");
+            let next = node.next;
+            if filter(&node.event.kind) {
+                if prev == NIL {
+                    self.head = next;
+                } else {
+                    self.nodes[prev as usize]
+                        .as_mut()
+                        .expect("previous node exists")
+                        .next = next;
+                }
+                self.nodes[current as usize] = None;
                 count += 1;
+            } else {
+                prev = current;
             }
+            current = next;
         }
+
         count
     }
 
-    /// Find the earliest deadline across all active events.
+    /// Return the earliest active deadline.
     pub fn earliest_deadline(&self) -> Option<u32> {
-        let mut earliest: Option<u32> = None;
-        for event in self.events.iter().flatten() {
-            earliest = Some(match earliest {
-                None => event.wake_clock,
-                Some(e) => {
-                    let delta = event.wake_clock.wrapping_sub(e) as i32;
-                    if delta < 0 { event.wake_clock } else { e }
-                }
-            });
+        if self.head == NIL {
+            None
+        } else {
+            self.nodes[self.head as usize].map(|node| node.event.wake_clock)
         }
-        earliest
-    }
-
-    /// Iterate over due events (wake_clock <= now in wraparound sense).
-    /// Returns indices of due events for the caller to process.
-    pub fn find_due(&self, now: u32) -> heapless::Vec<usize, MAX_SCHEDULER_EVENTS> {
-        let mut due = heapless::Vec::new();
-        for (i, slot) in self.events.iter().enumerate() {
-            if let Some(event) = slot {
-                let delta = now.wrapping_sub(event.wake_clock) as i32;
-                if delta >= 0 {
-                    let _ = due.push(i);
-                }
-            }
-        }
-        due
     }
 
     /// Remove and return the earliest due event.
@@ -138,57 +203,35 @@ impl TriggerScheduler {
     /// used by [`earliest_deadline`], so callers can repeatedly pop until it
     /// returns `None` and process all ready work in scheduler order.
     pub fn pop_due(&mut self, now: u32) -> Option<SchedulerEvent> {
-        let mut earliest_index: Option<usize> = None;
-        let mut earliest_clock: Option<u32> = None;
-        for (index, slot) in self.events.iter().enumerate() {
-            let Some(event) = slot else {
-                continue;
-            };
-            let due_delta = now.wrapping_sub(event.wake_clock) as i32;
-            if due_delta < 0 {
-                continue;
-            }
-            if earliest_clock.is_none_or(|earliest| {
-                let delta = event.wake_clock.wrapping_sub(earliest) as i32;
-                delta < 0
-            }) {
-                earliest_index = Some(index);
-                earliest_clock = Some(event.wake_clock);
-            }
+        if self.head == NIL {
+            return None;
         }
-        let index = earliest_index?;
-        let event = self.events[index];
-        self.events[index] = None;
-        event
-    }
-
-    /// Get event at index (for processing).
-    pub fn get(&self, index: usize) -> Option<&SchedulerEvent> {
-        self.events[index].as_ref()
-    }
-
-    /// Update the wake_clock of an event at index.
-    pub fn reschedule(&mut self, index: usize, new_clock: u32) {
-        if let Some(event) = &mut self.events[index] {
-            event.wake_clock = new_clock;
+        let index = self.head;
+        let node = self.nodes[index as usize]?;
+        if !is_due(now, node.event.wake_clock) {
+            return None;
         }
-    }
-
-    /// Remove event at index.
-    pub fn remove(&mut self, index: usize) {
-        self.events[index] = None;
+        self.head = node.next;
+        self.nodes[index as usize] = None;
+        Some(node.event)
     }
 
     /// Check if any events are active.
     pub fn is_empty(&self) -> bool {
-        self.events.iter().all(|e| e.is_none())
+        self.head == NIL
+    }
+
+    /// Check whether every scheduler slot is occupied.
+    pub fn is_full(&self) -> bool {
+        self.nodes.iter().all(Option::is_some)
     }
 
     /// Clear all events.
     pub fn clear(&mut self) {
-        for slot in &mut self.events {
+        for slot in &mut self.nodes {
             *slot = None;
         }
+        self.head = NIL;
         self.cc2_active = false;
     }
 }
@@ -215,23 +258,6 @@ mod tests {
         let s = TriggerScheduler::new();
         assert!(s.is_empty());
         assert_eq!(s.earliest_deadline(), None);
-    }
-
-    #[test]
-    fn schedule_and_find_due() {
-        let mut s = TriggerScheduler::new();
-        insert(
-            &mut s,
-            SchedulerEvent {
-                kind: SchedulerEventKind::EndstopSample(0),
-                wake_clock: 1000,
-            },
-        );
-        assert!(!s.is_empty());
-        let due = s.find_due(1000);
-        assert_eq!(due.len(), 1);
-        let due = s.find_due(999);
-        assert_eq!(due.len(), 0);
     }
 
     #[test]
@@ -289,21 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn wraparound_due_check() {
-        let mut s = TriggerScheduler::new();
-        insert(
-            &mut s,
-            SchedulerEvent {
-                kind: SchedulerEventKind::EndstopSample(0),
-                wake_clock: 0xFFFF_FF00,
-            },
-        );
-        // now=0x10 is past 0xFFFFFF00 in wraparound
-        let due = s.find_due(0x0000_0010);
-        assert_eq!(due.len(), 1);
-    }
-
-    #[test]
     fn wraparound_earliest_deadline() {
         let mut s = TriggerScheduler::new();
         insert(
@@ -322,25 +333,6 @@ mod tests {
         );
         // 0xFFFFFF00 is earlier than 0x100 in signed wraparound
         assert_eq!(s.earliest_deadline(), Some(0xFFFF_FF00));
-    }
-
-    #[test]
-    fn reschedule_updates_clock() {
-        let mut s = TriggerScheduler::new();
-        insert(
-            &mut s,
-            SchedulerEvent {
-                kind: SchedulerEventKind::TrSyncReport(0),
-                wake_clock: 1000,
-            },
-        );
-        let due = s.find_due(1000);
-        assert_eq!(due.len(), 1);
-        s.reschedule(due[0], 2000);
-        let due = s.find_due(1500);
-        assert_eq!(due.len(), 0);
-        let due = s.find_due(2000);
-        assert_eq!(due.len(), 1);
     }
 
     #[test]
@@ -406,6 +398,168 @@ mod tests {
             }),
             ScheduleResult::Full
         );
+    }
+
+    #[test]
+    fn equal_wake_clock_events_fire_in_insertion_order() {
+        let mut s = TriggerScheduler::new();
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 1000,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 1000,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+
+        assert_eq!(
+            s.pop_due(1000),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 1000,
+            })
+        );
+        assert_eq!(
+            s.pop_due(1000),
+            Some(SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 1000,
+            })
+        );
+    }
+
+    #[test]
+    fn pop_due_checks_head_only() {
+        let mut s = TriggerScheduler::new();
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 2000,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 3000,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+
+        assert_eq!(s.pop_due(1500), None);
+        assert_eq!(s.earliest_deadline(), Some(2000));
+    }
+
+    #[test]
+    fn try_schedule_inserts_at_middle_when_clock_between_others() {
+        let mut s = TriggerScheduler::new();
+        for (kind, wake_clock) in [
+            (SchedulerEventKind::EndstopSample(0), 1000),
+            (SchedulerEventKind::TrSyncReport(0), 3000),
+            (SchedulerEventKind::Stepper(0), 2000),
+        ] {
+            assert!(matches!(
+                s.try_schedule(SchedulerEvent { kind, wake_clock }),
+                ScheduleResult::Inserted { .. }
+            ));
+        }
+
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 1000);
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 2000);
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 3000);
+    }
+
+    #[test]
+    fn sorted_insert_preserves_signed_wraparound_order() {
+        let mut s = TriggerScheduler::new();
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 0x0000_0040,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 0xFFFF_FFF0,
+            }),
+            ScheduleResult::Inserted { new_earliest: true }
+        ));
+
+        assert_eq!(s.pop_due(0x0000_0080).unwrap().wake_clock, 0xFFFF_FFF0);
+        assert_eq!(s.pop_due(0x0000_0080).unwrap().wake_clock, 0x0000_0040);
+    }
+
+    #[test]
+    fn cancel_of_head_updates_head_pointer() {
+        let mut s = TriggerScheduler::new();
+        for wake_clock in [1000, 2000, 3000] {
+            assert!(matches!(
+                s.try_schedule(SchedulerEvent {
+                    kind: SchedulerEventKind::EndstopSample((wake_clock / 1000) as usize),
+                    wake_clock,
+                }),
+                ScheduleResult::Inserted { .. }
+            ));
+        }
+
+        assert_eq!(
+            s.cancel(|kind| matches!(kind, SchedulerEventKind::EndstopSample(1))),
+            1
+        );
+        assert_eq!(s.earliest_deadline(), Some(2000));
+    }
+
+    #[test]
+    fn cancel_of_middle_preserves_chain() {
+        let mut s = TriggerScheduler::new();
+        for wake_clock in [1000, 2000, 3000] {
+            assert!(matches!(
+                s.try_schedule(SchedulerEvent {
+                    kind: SchedulerEventKind::EndstopSample((wake_clock / 1000) as usize),
+                    wake_clock,
+                }),
+                ScheduleResult::Inserted { .. }
+            ));
+        }
+
+        assert_eq!(
+            s.cancel(|kind| matches!(kind, SchedulerEventKind::EndstopSample(2))),
+            1
+        );
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 1000);
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 3000);
+        assert_eq!(s.pop_due(4000), None);
+    }
+
+    #[test]
+    fn cancel_of_tail_keeps_head_valid() {
+        let mut s = TriggerScheduler::new();
+        for wake_clock in [1000, 2000, 3000] {
+            assert!(matches!(
+                s.try_schedule(SchedulerEvent {
+                    kind: SchedulerEventKind::EndstopSample((wake_clock / 1000) as usize),
+                    wake_clock,
+                }),
+                ScheduleResult::Inserted { .. }
+            ));
+        }
+
+        assert_eq!(
+            s.cancel(|kind| matches!(kind, SchedulerEventKind::EndstopSample(3))),
+            1
+        );
+        assert_eq!(s.earliest_deadline(), Some(1000));
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 1000);
+        assert_eq!(s.pop_due(4000).unwrap().wake_clock, 2000);
+        assert_eq!(s.pop_due(4000), None);
     }
 
     #[test]
