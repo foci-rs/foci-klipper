@@ -88,14 +88,6 @@ impl TriggerScheduler {
         }
     }
 
-    /// Schedule an event. Temporary compatibility wrapper for migration only.
-    pub fn schedule(&mut self, event: SchedulerEvent) -> bool {
-        match self.try_schedule(event) {
-            ScheduleResult::Inserted { new_earliest } => new_earliest,
-            ScheduleResult::Full => false,
-        }
-    }
-
     /// Cancel all events matching a filter. Returns number cancelled.
     pub fn cancel<F: Fn(&SchedulerEventKind) -> bool>(&mut self, filter: F) -> usize {
         let mut count = 0;
