@@ -220,10 +220,13 @@ mod tests {
     #[test]
     fn schedule_and_find_due() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 1000,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 1000,
+            },
+        );
         assert!(!s.is_empty());
         let due = s.find_due(1000);
         assert_eq!(due.len(), 1);
@@ -234,32 +237,47 @@ mod tests {
     #[test]
     fn earliest_deadline_correct() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncExpire(0),
-            wake_clock: 5000,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 2000,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncExpire(0),
+                wake_clock: 5000,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 2000,
+            },
+        );
         assert_eq!(s.earliest_deadline(), Some(2000));
     }
 
     #[test]
     fn cancel_by_kind() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncExpire(0),
-            wake_clock: 1000,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncReport(0),
-            wake_clock: 2000,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(1),
-            wake_clock: 3000,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncExpire(0),
+                wake_clock: 1000,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 2000,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(1),
+                wake_clock: 3000,
+            },
+        );
         let cancelled = s.cancel(|k| {
             matches!(
                 k,
@@ -273,10 +291,13 @@ mod tests {
     #[test]
     fn wraparound_due_check() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 0xFFFF_FF00,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 0xFFFF_FF00,
+            },
+        );
         // now=0x10 is past 0xFFFFFF00 in wraparound
         let due = s.find_due(0x0000_0010);
         assert_eq!(due.len(), 1);
@@ -285,14 +306,20 @@ mod tests {
     #[test]
     fn wraparound_earliest_deadline() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 0x0000_0100,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncExpire(0),
-            wake_clock: 0xFFFF_FF00,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 0x0000_0100,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncExpire(0),
+                wake_clock: 0xFFFF_FF00,
+            },
+        );
         // 0xFFFFFF00 is earlier than 0x100 in signed wraparound
         assert_eq!(s.earliest_deadline(), Some(0xFFFF_FF00));
     }
@@ -300,10 +327,13 @@ mod tests {
     #[test]
     fn reschedule_updates_clock() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncReport(0),
-            wake_clock: 1000,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 1000,
+            },
+        );
         let due = s.find_due(1000);
         assert_eq!(due.len(), 1);
         s.reschedule(due[0], 2000);
@@ -316,10 +346,13 @@ mod tests {
     #[test]
     fn clear_removes_all() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 1000,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 1000,
+            },
+        );
         s.clear();
         assert!(s.is_empty());
         assert!(!s.cc2_active());
@@ -378,18 +411,27 @@ mod tests {
     #[test]
     fn pop_due_processes_stepper_and_trigger_events_in_clock_order() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 1100,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::Stepper(0),
-            wake_clock: 1000,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncReport(0),
-            wake_clock: 1050,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 1100,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 1000,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 1050,
+            },
+        );
 
         assert_eq!(
             s.pop_due(1200),
@@ -418,14 +460,20 @@ mod tests {
     #[test]
     fn pop_due_respects_wraparound_clock_order() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::EndstopSample(0),
-            wake_clock: 0x0000_0040,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::Stepper(0),
-            wake_clock: 0xFFFF_FFF0,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::EndstopSample(0),
+                wake_clock: 0x0000_0040,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 0xFFFF_FFF0,
+            },
+        );
 
         assert_eq!(
             s.pop_due(0x0000_0080),
@@ -447,14 +495,20 @@ mod tests {
     #[test]
     fn cancel_removes_stale_stepper_event_without_clearing_triggers() {
         let mut s = TriggerScheduler::new();
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::Stepper(0),
-            wake_clock: 1000,
-        });
-        insert(&mut s, SchedulerEvent {
-            kind: SchedulerEventKind::TrSyncExpire(0),
-            wake_clock: 1200,
-        });
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 1000,
+            },
+        );
+        insert(
+            &mut s,
+            SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncExpire(0),
+                wake_clock: 1200,
+            },
+        );
 
         let cancelled = s.cancel(|kind| matches!(kind, SchedulerEventKind::Stepper(0)));
 
