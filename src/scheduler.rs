@@ -40,6 +40,20 @@ pub enum ScheduleResult {
     Full,
 }
 
+/// Token for a popped scheduler slot that can be requeued by the same dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScheduledSlot {
+    index: u8,
+    event: SchedulerEvent,
+}
+
+impl ScheduledSlot {
+    /// Return the event carried by this popped slot.
+    pub fn event(&self) -> SchedulerEvent {
+        self.event
+    }
+}
+
 /// Return the hardware compare clock to arm for a scheduler deadline.
 ///
 /// If `deadline` is farther than `min_lead_ticks` in the future, callers can
@@ -203,6 +217,11 @@ impl TriggerScheduler {
     /// used by [`earliest_deadline`], so callers can repeatedly pop until it
     /// returns `None` and process all ready work in scheduler order.
     pub fn pop_due(&mut self, now: u32) -> Option<SchedulerEvent> {
+        self.pop_due_slot(now).map(|slot| slot.event())
+    }
+
+    /// Remove and return the earliest due event with its reusable slot token.
+    pub fn pop_due_slot(&mut self, now: u32) -> Option<ScheduledSlot> {
         if self.head == NIL {
             return None;
         }
@@ -213,7 +232,27 @@ impl TriggerScheduler {
         }
         self.head = node.next;
         self.nodes[index as usize] = None;
-        Some(node.event)
+        Some(ScheduledSlot {
+            index,
+            event: node.event,
+        })
+    }
+
+    /// Requeue a previously popped slot with the same event kind and new clock.
+    pub fn requeue_slot(&mut self, slot: ScheduledSlot, new_clock: u32) -> ScheduleResult {
+        let index = slot.index as usize;
+        if index >= MAX_SCHEDULER_EVENTS || self.nodes[index].is_some() {
+            return self.try_schedule(SchedulerEvent {
+                kind: slot.event.kind,
+                wake_clock: new_clock,
+            });
+        }
+        let event = SchedulerEvent {
+            kind: slot.event.kind,
+            wake_clock: new_clock,
+        };
+        let new_earliest = self.insert_node(slot.index, event);
+        ScheduleResult::Inserted { new_earliest }
     }
 
     /// Check if any events are active.
@@ -560,6 +599,53 @@ mod tests {
         assert_eq!(s.pop_due(4000).unwrap().wake_clock, 1000);
         assert_eq!(s.pop_due(4000).unwrap().wake_clock, 2000);
         assert_eq!(s.pop_due(4000), None);
+    }
+
+    #[test]
+    fn pop_due_slot_requeue_slot_preserves_event_order() {
+        let mut s = TriggerScheduler::new();
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 1000,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+        let slot = s.pop_due_slot(1000).expect("stepper due");
+        assert_eq!(slot.event().kind, SchedulerEventKind::Stepper(0));
+        assert!(matches!(
+            s.requeue_slot(slot, 2000),
+            ScheduleResult::Inserted { new_earliest: true }
+        ));
+        assert_eq!(s.earliest_deadline(), Some(2000));
+    }
+
+    #[test]
+    fn requeue_slot_inserts_after_earlier_event() {
+        let mut s = TriggerScheduler::new();
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::Stepper(0),
+                wake_clock: 1000,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+        assert!(matches!(
+            s.try_schedule(SchedulerEvent {
+                kind: SchedulerEventKind::TrSyncReport(0),
+                wake_clock: 1500,
+            }),
+            ScheduleResult::Inserted { .. }
+        ));
+        let slot = s.pop_due_slot(1000).expect("stepper due");
+        assert!(matches!(
+            s.requeue_slot(slot, 2000),
+            ScheduleResult::Inserted {
+                new_earliest: false,
+            }
+        ));
+        assert_eq!(s.pop_due(2500).unwrap().wake_clock, 1500);
+        assert_eq!(s.pop_due(2500).unwrap().wake_clock, 2000);
     }
 
     #[test]
