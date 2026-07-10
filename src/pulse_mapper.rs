@@ -309,11 +309,10 @@ mod tests {
         for planner_steps_per_rev in REPRESENTATIVE_STEPS {
             let mut pulse_mapper = mapper(planner_steps_per_rev);
             let planner_scale = i64::from(planner_steps_per_rev);
-            let grid = i64::from(pulse_mapper.tmc_grid());
-            let initial_phase = pulse_mapper.phase();
-            let mut reference_phase = initial_phase;
+            let grid = i64::from(expected_grid(planner_steps_per_rev));
+            let initial_phase = i64::from(planner_steps_per_rev / 2);
+            let mut logical_displacement = 0_i64;
             let mut cumulative_pulses = 0_i64;
-            let mut reference_pulses = 0_i64;
             let mut directions = [false; 257];
             let mut state = 0x6d2b_79f5_u32;
 
@@ -323,29 +322,32 @@ mod tests {
                 state ^= state << 5;
                 *direction = state & 1 != 0;
                 let signed_direction = if *direction { 1_i64 } else { -1_i64 };
-                let total = reference_phase + signed_direction * grid;
-                reference_pulses += total.div_euclid(planner_scale);
-                reference_phase = total.rem_euclid(planner_scale);
+                logical_displacement += signed_direction;
+                let rational_position = initial_phase + logical_displacement * grid;
+                let expected_pulses = rational_position.div_euclid(planner_scale);
+                let expected_phase = rational_position.rem_euclid(planner_scale);
                 let pulses = pulse_mapper.map_step(*direction);
                 cumulative_pulses += i64::from(pulses);
 
-                assert_eq!(cumulative_pulses, reference_pulses);
-                assert_eq!(pulse_mapper.phase(), reference_phase);
+                assert_eq!(cumulative_pulses, expected_pulses);
+                assert_eq!(pulse_mapper.phase(), expected_phase);
                 assert!((-2..=2).contains(&pulses));
             }
 
             for direction in directions.into_iter().rev() {
                 let inverse = !direction;
                 let signed_direction = if inverse { 1_i64 } else { -1_i64 };
-                let total = reference_phase + signed_direction * grid;
-                reference_pulses += total.div_euclid(planner_scale);
-                reference_phase = total.rem_euclid(planner_scale);
+                logical_displacement += signed_direction;
+                let rational_position = initial_phase + logical_displacement * grid;
+                let expected_pulses = rational_position.div_euclid(planner_scale);
+                let expected_phase = rational_position.rem_euclid(planner_scale);
                 cumulative_pulses += i64::from(pulse_mapper.map_step(inverse));
 
-                assert_eq!(cumulative_pulses, reference_pulses);
-                assert_eq!(pulse_mapper.phase(), reference_phase);
+                assert_eq!(cumulative_pulses, expected_pulses);
+                assert_eq!(pulse_mapper.phase(), expected_phase);
             }
 
+            assert_eq!(logical_displacement, 0);
             assert_eq!(cumulative_pulses, 0);
             assert_eq!(pulse_mapper.phase(), initial_phase);
         }
