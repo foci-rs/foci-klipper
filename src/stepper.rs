@@ -574,6 +574,40 @@ mod hardware_stepper_tests {
     }
 
     #[test]
+    fn active_stepper_preserves_future_deadline() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 1, 0));
+        stepper.step_event();
+
+        assert_eq!(stepper.check_deadline(1_100, 1_000, 84_000_000), Ok(1_100));
+    }
+
+    #[test]
+    fn active_stepper_nudges_slightly_past_deadline() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 1, 0));
+        stepper.step_event();
+
+        assert_eq!(stepper.check_deadline(999, 1_000, 84_000_000), Ok(1_002));
+    }
+
+    #[test]
+    fn active_stepper_compares_deadlines_across_clock_wrap() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 1, 0));
+        stepper.step_event();
+
+        assert_eq!(
+            stepper.check_deadline(0x0000_0010, 0xffff_fff0, 84_000_000),
+            Ok(0x0000_0010)
+        );
+        assert_eq!(
+            stepper.check_deadline(0xffff_fff0, 0x0000_0010, 84_000_000),
+            Ok(0x0000_0012)
+        );
+    }
+
+    #[test]
     fn reset_clears_loaded_move_but_not_motion_scale() {
         let mut stepper = configured_stepper(3_200);
         stepper.load_move(StepMove::new(100, 2, 0));
