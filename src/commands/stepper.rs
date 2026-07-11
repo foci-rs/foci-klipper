@@ -69,12 +69,16 @@ pub fn queue_step_hw(
     need_reset: bool,
     count: u16,
     queue_was_empty: bool,
+    motion_scale_configured: bool,
 ) -> Result<QueueStepResult, CommandError> {
     if need_reset {
         return Ok(QueueStepResult::Discarded);
     }
     if count == 0 {
         return Err(CommandError::ZeroCount);
+    }
+    if !motion_scale_configured {
+        return Err(CommandError::MotionScaleUnconfigured);
     }
     if queue_was_empty {
         Ok(QueueStepResult::QueuedFirstMove)
@@ -201,26 +205,32 @@ mod tests {
 
     #[test]
     fn queue_step_hw_need_reset_discards() {
-        let result = queue_step_hw(true, 10, false);
+        let result = queue_step_hw(true, 10, false, false);
         assert_eq!(result, Ok(QueueStepResult::Discarded));
     }
 
     #[test]
     fn queue_step_hw_zero_count_errors() {
-        let result = queue_step_hw(false, 0, false);
+        let result = queue_step_hw(false, 0, false, true);
         assert_eq!(result, Err(CommandError::ZeroCount));
     }
 
     #[test]
     fn queue_step_hw_normal_queued() {
-        let result = queue_step_hw(false, 10, false);
+        let result = queue_step_hw(false, 10, false, true);
         assert_eq!(result, Ok(QueueStepResult::Queued));
     }
 
     #[test]
     fn queue_step_hw_first_move() {
-        let result = queue_step_hw(false, 10, true);
+        let result = queue_step_hw(false, 10, true, true);
         assert_eq!(result, Ok(QueueStepResult::QueuedFirstMove));
+    }
+
+    #[test]
+    fn queue_step_hw_requires_configured_motion_scale() {
+        let result = queue_step_hw(false, 10, true, false);
+        assert_eq!(result, Err(CommandError::MotionScaleUnconfigured));
     }
 
     #[test]

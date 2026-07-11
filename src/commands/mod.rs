@@ -28,6 +28,8 @@ pub enum CommandError {
     StepperActive,
     /// Zero-count move rejected.
     ZeroCount,
+    /// Motion was queued before the logical-to-physical scale was configured.
+    MotionScaleUnconfigured,
 }
 
 /// Returned by [`lifecycle::clear_shutdown`] when called outside shutdown state.
