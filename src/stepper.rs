@@ -102,7 +102,8 @@ impl StepEventResult {
 /// - **ISR state** (`current_*`, `next_step_clock`, `was_active`, `dir_state`):
 ///   Only accessed by the P3 timer ISR via `load_move()` and `step_event()`.
 /// - **P2 state** (`last_dir`, `next_dir`): Only accessed by P2 command
-///   handlers via `set_next_step_dir()` and `prepare_move()`.
+///   handlers via `set_next_step_dir()`, `next_move_changes_direction()`, and
+///   `prepare_move()`.
 ///
 /// The move queue and atomic flags live outside this struct as statics
 /// in the board crate (see spec: Concurrency Model).
@@ -163,6 +164,14 @@ impl HardwareStepper {
     /// Called from P2 `set_next_step_dir` command handler.
     pub fn set_next_step_dir(&mut self, forward: bool) {
         self.next_dir = forward;
+    }
+
+    /// Returns whether the next queued move would change direction.
+    ///
+    /// This preview does not consume the pending direction change. A subsequent
+    /// [`prepare_move`](Self::prepare_move) call records and consumes it.
+    pub const fn next_move_changes_direction(&self) -> bool {
+        self.last_dir != self.next_dir
     }
 
     /// Prepare a move for queuing by attaching direction state.
@@ -393,6 +402,22 @@ mod hardware_stepper_tests {
         stepper.set_next_step_dir(false);
         assert!(stepper.prepare_move(StepMove::new(100, 1, 0)).dir_changed);
         assert!(!stepper.prepare_move(StepMove::new(100, 1, 0)).dir_changed);
+    }
+
+    #[test]
+    fn direction_change_preview_tracks_pending_move_without_consuming_it() {
+        let mut stepper = HardwareStepper::new();
+        assert!(!stepper.next_move_changes_direction());
+
+        stepper.set_next_step_dir(false);
+        assert!(stepper.next_move_changes_direction());
+        assert!(stepper.next_move_changes_direction());
+
+        stepper.prepare_move(StepMove::new(100, 1, 0));
+        assert!(!stepper.next_move_changes_direction());
+
+        stepper.set_next_step_dir(true);
+        assert!(stepper.next_move_changes_direction());
     }
 
     #[test]
