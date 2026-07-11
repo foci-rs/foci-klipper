@@ -222,6 +222,20 @@ impl HardwareStepper {
         self.was_active = false;
     }
 
+    /// Remove the logical-to-physical pulse mapper without resetting stepper state.
+    ///
+    /// The caller must first stop the step timer and prevent move-queue execution. After this
+    /// call, [`step_event`](Self::step_event) is invalid until
+    /// [`configure_motion_scale`](Self::configure_motion_scale) succeeds, and queue admission
+    /// must reject moves while the motion scale is unconfigured.
+    ///
+    /// This unconditionally clears the mapper, including while a move is loaded, so a subsequent
+    /// configuration failure leaves the stepper fail-closed. Calling it repeatedly has no further
+    /// effect. Logical clock, position, direction, and ordinary lifecycle state are preserved.
+    pub fn clear_motion_scale(&mut self) {
+        self.pulse_mapper = None;
+    }
+
     /// Configure or replace the logical-to-physical pulse mapper at a common origin.
     ///
     /// # Errors
@@ -577,6 +591,41 @@ mod hardware_stepper_tests {
     }
 
     #[test]
+    fn clearing_motion_scale_is_idempotent_and_unconfigures_accessors() {
+        let mut stepper = configured_stepper(3_200);
+
+        stepper.clear_motion_scale();
+
+        assert!(!stepper.motion_scale_configured());
+        assert_eq!(stepper.planner_steps_per_rev(), None);
+        assert_eq!(stepper.mapper_phase(), None);
+
+        stepper.clear_motion_scale();
+        assert!(!stepper.motion_scale_configured());
+    }
+
+    #[test]
+    fn clearing_loaded_motion_scale_stays_fail_closed_until_reset() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 1, 0));
+        stepper.clear_motion_scale();
+        let replacement = PulseMapperConfig::new(4_000).unwrap();
+
+        assert_eq!(
+            stepper.configure_motion_scale(replacement),
+            Err(MotionScaleConfigError::MoveLoaded)
+        );
+        assert!(!stepper.motion_scale_configured());
+        assert_eq!(stepper.planner_steps_per_rev(), None);
+        assert_eq!(stepper.mapper_phase(), None);
+
+        stepper.reset();
+        stepper.configure_motion_scale(replacement).unwrap();
+        assert_eq!(stepper.planner_steps_per_rev(), Some(4_000));
+        assert_eq!(stepper.mapper_phase(), Some(2_000));
+    }
+
+    #[test]
     fn minimum_interval_uses_acceleration_endpoint() {
         assert_eq!(StepMove::new(100, 5, 20).minimum_interval(), 100);
         assert_eq!(StepMove::new(100, 5, -20).minimum_interval(), 20);
@@ -652,9 +701,12 @@ mod hardware_stepper_tests {
     fn reset_clears_loaded_move_but_not_motion_scale() {
         let mut stepper = configured_stepper(3_200);
         stepper.load_move(StepMove::new(100, 2, 0));
+        let phase = stepper.mapper_phase();
         stepper.reset();
 
         assert!(!stepper.has_active_segment());
         assert!(stepper.motion_scale_configured());
+        assert_eq!(stepper.planner_steps_per_rev(), Some(3_200));
+        assert_eq!(stepper.mapper_phase(), phase);
     }
 }
