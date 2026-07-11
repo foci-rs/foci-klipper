@@ -65,6 +65,15 @@ pub enum QueueStepResult {
 ///
 /// `queue_was_empty` should reflect whether the SPSC queue was empty before
 /// the caller pushes this move.
+/// `motion_scale_configured` should reflect whether the logical-to-physical
+/// pulse mapper has been configured for this stepper.
+///
+/// # Errors
+///
+/// Returns [`CommandError::ZeroCount`] when `need_reset` is false and `count`
+/// is zero. Returns [`CommandError::MotionScaleUnconfigured`] when
+/// `need_reset` is false, `count` is positive, and `motion_scale_configured`
+/// is false.
 pub fn queue_step_hw(
     need_reset: bool,
     count: u16,

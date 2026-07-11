@@ -468,6 +468,22 @@ mod hardware_stepper_tests {
     }
 
     #[test]
+    fn negative_add_clamps_runtime_interval_to_one_tick() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.reset_step_clock(0);
+        stepper.load_move(StepMove::new(5, 4, -3));
+
+        assert_eq!(stepper.step_event().next_clock(), Some(7));
+        assert_eq!(stepper.current_interval(), 2);
+        assert_eq!(stepper.step_event().next_clock(), Some(8));
+        assert_eq!(stepper.current_interval(), 1);
+        assert_eq!(stepper.step_event().next_clock(), Some(9));
+        assert_eq!(stepper.current_interval(), 1);
+        assert_eq!(stepper.step_event().next_clock(), None);
+        assert_eq!(stepper.current_interval(), 1);
+    }
+
+    #[test]
     fn logical_position_counts_once_per_event_in_both_directions() {
         let mut stepper = configured_stepper(3_200);
         stepper.load_move(StepMove::new(100, 2, 0));
