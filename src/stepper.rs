@@ -19,22 +19,23 @@ pub struct StepMove {
     pub count: u16,
     /// Interval change per step (acceleration).
     pub add: i16,
-    /// Whether direction changed relative to the previous move.
-    /// Set by `HardwareStepper::prepare_move` when `last_dir != next_dir`
-    /// (matches Klipper's `MF_DIR` flag). When true, `load_move()` toggles
-    /// the stepper's direction state.
-    dir_changed: bool,
+    /// Absolute DIR level for this segment.
+    ///
+    /// Storing the level rather than a relative toggle keeps later segments
+    /// correct when a stop path discards queued moves.
+    direction: bool,
 }
 impl StepMove {
-    /// Create a new move segment with `dir_changed = false`.
+    /// Create a new forward move segment.
     ///
-    /// The `dir_changed` flag is set by `HardwareStepper::prepare_move`.
+    /// [`HardwareStepper::prepare_move`] replaces the direction with the
+    /// command-side level selected for the queued move.
     pub const fn new(interval: u32, count: u16, add: i16) -> Self {
         Self {
             interval,
             count,
             add,
-            dir_changed: false,
+            direction: true,
         }
     }
 
@@ -177,14 +178,16 @@ impl HardwareStepper {
     /// Prepare a move for queuing by attaching direction state.
     ///
     /// Called from P2 `queue_step` command handler. Returns the amended
-    /// `StepMove` with `dir_changed` set if direction changed since the
-    /// last queued move. The caller pushes the result to the SPSC queue.
+    /// [`StepMove`] with the absolute direction selected for the queued move.
+    /// The caller pushes the result to the SPSC queue.
     pub fn prepare_move(&mut self, m: StepMove) -> StepMove {
-        let dir_changed = self.last_dir != self.next_dir;
-        if dir_changed {
+        if self.last_dir != self.next_dir {
             self.last_dir = self.next_dir;
         }
-        StepMove { dir_changed, ..m }
+        StepMove {
+            direction: self.next_dir,
+            ..m
+        }
     }
 
     /// Set the step clock reference.
@@ -284,8 +287,8 @@ impl HardwareStepper {
         self.current_count = m.count;
         self.current_add = m.add;
         self.next_step_clock = self.next_step_clock.wrapping_add(m.interval);
-        if m.dir_changed {
-            self.dir_state = !self.dir_state;
+        if self.dir_state != m.direction {
+            self.dir_state = m.direction;
             self.dir_setup_pending = true;
         }
     }
@@ -409,13 +412,28 @@ mod hardware_stepper_tests {
     }
 
     #[test]
-    fn prepare_move_records_only_real_direction_changes() {
+    fn prepare_move_records_absolute_direction() {
         let mut stepper = HardwareStepper::new();
-        assert!(!stepper.prepare_move(StepMove::new(100, 1, 0)).dir_changed);
+        assert!(stepper.prepare_move(StepMove::new(100, 1, 0)).direction);
 
         stepper.set_next_step_dir(false);
-        assert!(stepper.prepare_move(StepMove::new(100, 1, 0)).dir_changed);
-        assert!(!stepper.prepare_move(StepMove::new(100, 1, 0)).dir_changed);
+        assert!(!stepper.prepare_move(StepMove::new(100, 1, 0)).direction);
+        assert!(!stepper.prepare_move(StepMove::new(100, 1, 0)).direction);
+    }
+
+    #[test]
+    fn discarded_direction_change_does_not_invert_the_next_executed_move() {
+        let mut command_stepper = HardwareStepper::new();
+        let mut isr_stepper = configured_stepper(3_200);
+
+        command_stepper.set_next_step_dir(false);
+        let discarded = command_stepper.prepare_move(StepMove::new(100, 1, 0));
+        assert!(!discarded.direction);
+
+        let next = command_stepper.prepare_move(StepMove::new(100, 1, 0));
+        isr_stepper.load_move(next);
+
+        assert!(!isr_stepper.step_event().event().direction);
     }
 
     #[test]
