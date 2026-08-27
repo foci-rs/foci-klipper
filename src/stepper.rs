@@ -11,7 +11,7 @@ use crate::pulse_mapper::{PulseMapperConfig, ReversiblePulseMapper};
 pub struct MissedDeadline;
 
 /// A single move segment from Klipper's `queue_step` command.
-#[derive(Debug, Clone, Copy, defmt::Format)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub struct StepMove {
     /// Clock ticks between steps (initial value for this segment).
     pub interval: u32,
