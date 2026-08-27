@@ -8,5 +8,6 @@ pub mod pulse_mapper;
 pub mod scheduler;
 pub mod shutdown;
 pub mod state;
+pub mod step_queue;
 pub mod stepper;
 pub mod trigger;
