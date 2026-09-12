@@ -121,9 +121,9 @@ pub struct HardwareStepper {
     /// Whether the stepper was active before loading the current segment.
     /// Used for missed-deadline check (Klipper `was_active` semantics).
     was_active: bool,
-    /// Current DIR pin state (true = forward).
+    /// Direction used by the current or most recent ISR move.
     dir_state: bool,
-    /// Whether the next logical event requires board-owned DIR setup.
+    /// Whether the next logical event must establish the board-owned DIR level.
     dir_setup_pending: bool,
     /// Stateful logical-to-physical pulse mapper.
     pulse_mapper: Option<ReversiblePulseMapper>,
@@ -151,7 +151,7 @@ impl HardwareStepper {
             next_step_clock: 0,
             was_active: false,
             dir_state: true,
-            dir_setup_pending: false,
+            dir_setup_pending: true,
             pulse_mapper: None,
             last_dir: true,
             next_dir: true,
@@ -205,13 +205,14 @@ impl HardwareStepper {
     /// Clears the active segment so the next ISR entry dequeues a fresh
     /// move. Called by `stop_physical_stepper_no_lock()` after disabling
     /// the step timer to prevent stale partial segments from executing
-    /// when the timer is re-armed.
+    /// when the timer is re-armed. The next event must also re-establish DIR
+    /// because board stop paths reset the GPIO independently.
     pub fn reset(&mut self) {
         self.current_count = 0;
         self.current_interval = 0;
         self.current_add = 0;
         self.was_active = false;
-        self.dir_setup_pending = false;
+        self.dir_setup_pending = true;
     }
 
     /// Mark the stepper idle after the move queue is observed empty.
@@ -465,7 +466,7 @@ mod hardware_stepper_tests {
                 event: LogicalStepEvent {
                     direction: true,
                     physical_pulses: 1,
-                    dir_setup_required: false,
+                    dir_setup_required: true,
                 },
             }
         );
@@ -579,6 +580,31 @@ mod hardware_stepper_tests {
         assert!(reverse.dir_setup_required);
         assert_eq!(stepper.mapper_phase(), Some(1_600));
         assert_ne!(phase_after_forward, stepper.mapper_phase().unwrap());
+    }
+
+    #[test]
+    fn first_move_reports_dir_setup_even_when_forward() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 1, 0));
+
+        let event = stepper.step_event().event();
+
+        assert!(event.direction);
+        assert!(event.dir_setup_required);
+    }
+
+    #[test]
+    fn reset_requires_dir_setup_for_the_cached_direction() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 1, 0));
+        stepper.step_event();
+        stepper.reset();
+        stepper.load_move(StepMove::new(100, 1, 0));
+
+        let event = stepper.step_event().event();
+
+        assert!(event.direction);
+        assert!(event.dir_setup_required);
     }
 
     #[test]
