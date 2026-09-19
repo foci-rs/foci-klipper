@@ -628,7 +628,7 @@ mod hardware_stepper_tests {
     fn reset_clears_last_phase_class_so_the_next_move_reports_no_transition() {
         let mut stepper = configured_stepper(3_200);
         stepper.load_move(StepMove::new(100, 5, -1));
-        stepper.load_move(StepMove::new(100, 5, 1)); // now Decel
+        stepper.load_move(StepMove::new(100, 5, 1));
         stepper.reset();
         // Next move's first segment is also Decel, but reset() must have
         // cleared last_phase_class, so this must NOT report a transition.
@@ -639,7 +639,7 @@ mod hardware_stepper_tests {
     fn mark_idle_clears_last_phase_class_so_the_next_move_reports_no_transition() {
         let mut stepper = configured_stepper(3_200);
         stepper.load_move(StepMove::new(100, 5, -1));
-        stepper.load_move(StepMove::new(100, 5, 1)); // now Decel
+        stepper.load_move(StepMove::new(100, 5, 1));
         stepper.mark_idle();
         assert_eq!(stepper.load_move(StepMove::new(100, 5, 1)), None);
     }
