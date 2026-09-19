@@ -97,6 +97,29 @@ impl StepEventResult {
     }
 }
 
+/// Coarse motion-phase classification of a step-queue segment, derived from
+/// its `add` sign. `add < 0` shrinks the interval each step (faster stepping,
+/// acceleration); `add > 0` grows it (deceleration); `add == 0` holds it
+/// constant (cruise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum PhaseClass {
+    Accel = 0,
+    Cruise = 1,
+    Decel = 2,
+}
+
+impl PhaseClass {
+    const fn from_add(add: i16) -> Self {
+        if add < 0 {
+            PhaseClass::Accel
+        } else if add > 0 {
+            PhaseClass::Decel
+        } else {
+            PhaseClass::Cruise
+        }
+    }
+}
+
 /// Timer-driven hardware stepper scheduling engine.
 ///
 /// This struct holds two categories of state:
@@ -125,6 +148,11 @@ pub struct HardwareStepper {
     dir_state: bool,
     /// Whether the next logical event must establish the board-owned DIR level.
     dir_setup_pending: bool,
+    /// Phase class of the most recently loaded segment, for phase-boundary
+    /// marker detection. `None` when no segment has been loaded since the
+    /// last `reset()`/`mark_idle()` — a fresh move has no valid prior phase
+    /// to compare against.
+    last_phase_class: Option<PhaseClass>,
     /// Stateful logical-to-physical pulse mapper.
     pulse_mapper: Option<ReversiblePulseMapper>,
 
@@ -152,6 +180,7 @@ impl HardwareStepper {
             was_active: false,
             dir_state: true,
             dir_setup_pending: true,
+            last_phase_class: None,
             pulse_mapper: None,
             last_dir: true,
             next_dir: true,
@@ -213,6 +242,7 @@ impl HardwareStepper {
         self.current_add = 0;
         self.was_active = false;
         self.dir_setup_pending = true;
+        self.last_phase_class = None;
     }
 
     /// Mark the stepper idle after the move queue is observed empty.
@@ -224,6 +254,7 @@ impl HardwareStepper {
     /// so the board ISR must explicitly call this when the queue is empty.
     pub fn mark_idle(&mut self) {
         self.was_active = false;
+        self.last_phase_class = None;
     }
 
     /// Remove the logical-to-physical pulse mapper without resetting stepper state.
@@ -282,7 +313,9 @@ impl HardwareStepper {
     ///
     /// Called from P3 timer ISR when the previous segment is exhausted.
     /// Sets `was_active` based on whether there was a previous segment.
-    pub fn load_move(&mut self, m: StepMove) {
+    /// Returns `Some((old_phase, new_phase))` if the motion phase changed,
+    /// or `None` if there was no prior phase or the phase remained the same.
+    pub fn load_move(&mut self, m: StepMove) -> Option<(PhaseClass, PhaseClass)> {
         self.was_active = self.was_active || self.current_count > 0;
         self.current_interval = m.interval;
         self.current_count = m.count;
@@ -292,6 +325,13 @@ impl HardwareStepper {
             self.dir_state = m.direction;
             self.dir_setup_pending = true;
         }
+        let new_class = PhaseClass::from_add(m.add);
+        let transition = match self.last_phase_class {
+            Some(prev) if prev != new_class => Some((prev, new_class)),
+            _ => None,
+        };
+        self.last_phase_class = Some(new_class);
+        transition
     }
 
     /// Consume one logical planner step and return its physical pulse work.
@@ -523,6 +563,85 @@ mod hardware_stepper_tests {
         assert_eq!(stepper.step_event().next_clock(), None);
         stepper.load_move(StepMove::new(60, 1, 0));
         assert_eq!(stepper.next_step_clock(), 240);
+    }
+
+    #[test]
+    fn load_move_reports_no_transition_for_the_first_segment_after_reset() {
+        let mut stepper = configured_stepper(3_200);
+        assert_eq!(stepper.load_move(StepMove::new(100, 5, -1)), None);
+    }
+
+    #[test]
+    fn load_move_reports_no_transition_for_the_first_segment_after_idle() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 5, -1));
+        stepper.mark_idle();
+        assert_eq!(stepper.load_move(StepMove::new(100, 5, -1)), None);
+    }
+
+    #[test]
+    fn load_move_reports_no_transition_when_add_sign_is_unchanged() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 5, -1));
+        assert_eq!(stepper.load_move(StepMove::new(90, 5, -1)), None);
+    }
+
+    #[test]
+    fn load_move_reports_no_transition_across_two_zero_add_segments() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 5, 0));
+        assert_eq!(stepper.load_move(StepMove::new(100, 5, 0)), None);
+    }
+
+    #[test]
+    fn load_move_maps_negative_add_to_accel_and_positive_add_to_decel() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 5, -1));
+        assert_eq!(
+            stepper.load_move(StepMove::new(90, 5, 1)),
+            Some((PhaseClass::Accel, PhaseClass::Decel))
+        );
+    }
+
+    #[test]
+    fn load_move_reports_each_of_the_six_class_transitions() {
+        let cases = [
+            (-1, 0, PhaseClass::Accel, PhaseClass::Cruise),
+            (-1, 1, PhaseClass::Accel, PhaseClass::Decel),
+            (0, -1, PhaseClass::Cruise, PhaseClass::Accel),
+            (0, 1, PhaseClass::Cruise, PhaseClass::Decel),
+            (1, -1, PhaseClass::Decel, PhaseClass::Accel),
+            (1, 0, PhaseClass::Decel, PhaseClass::Cruise),
+        ];
+        for (first_add, second_add, expected_old, expected_new) in cases {
+            let mut stepper = configured_stepper(3_200);
+            stepper.load_move(StepMove::new(100, 5, first_add));
+            assert_eq!(
+                stepper.load_move(StepMove::new(100, 5, second_add)),
+                Some((expected_old, expected_new)),
+                "first_add={first_add} second_add={second_add}"
+            );
+        }
+    }
+
+    #[test]
+    fn reset_clears_last_phase_class_so_the_next_move_reports_no_transition() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 5, -1));
+        stepper.load_move(StepMove::new(100, 5, 1)); // now Decel
+        stepper.reset();
+        // Next move's first segment is also Decel, but reset() must have
+        // cleared last_phase_class, so this must NOT report a transition.
+        assert_eq!(stepper.load_move(StepMove::new(100, 5, 1)), None);
+    }
+
+    #[test]
+    fn mark_idle_clears_last_phase_class_so_the_next_move_reports_no_transition() {
+        let mut stepper = configured_stepper(3_200);
+        stepper.load_move(StepMove::new(100, 5, -1));
+        stepper.load_move(StepMove::new(100, 5, 1)); // now Decel
+        stepper.mark_idle();
+        assert_eq!(stepper.load_move(StepMove::new(100, 5, 1)), None);
     }
 
     #[test]
