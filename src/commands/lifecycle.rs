@@ -3,6 +3,10 @@
 use crate::commands::ShutdownRequired;
 use crate::shutdown::McuState;
 use crate::state::State;
+use crate::step_queue::STEP_QUEUE_DEPTH;
+
+/// Moves the host may queue: `heapless::spsc` keeps one slot empty.
+const MOVE_COUNT: u16 = (STEP_QUEUE_DEPTH - 1) as u16;
 
 /// Return protocol config state for `get_config` reply.
 ///
@@ -11,7 +15,7 @@ pub fn get_config(state: &State) -> (bool, u32, bool, u16) {
     let is_config = state.config_crc.is_some();
     let crc = state.config_crc.unwrap_or(0);
     let is_shutdown = state.mcu_state.is_shutdown();
-    (is_config, crc, is_shutdown, 1024)
+    (is_config, crc, is_shutdown, MOVE_COUNT)
 }
 
 /// Clear shutdown state, transitioning back to Running.
@@ -60,15 +64,31 @@ pub fn allocate_oids(_count: u8) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::step_queue::StepQueueChannel;
+    use crate::stepper::StepMove;
+
+    #[test]
+    fn one_channel_accepts_every_move_the_host_may_queue() {
+        // Klipper shares move_count across all steppers on the MCU, so a
+        // single channel can legitimately receive all of them.
+        static CHANNEL: StepQueueChannel<STEP_QUEUE_DEPTH> = StepQueueChannel::new();
+        let mut producer = unsafe { CHANNEL.split_once() };
+        let (_, _, _, move_count) = get_config(&State::new());
+
+        let accepted = (0..move_count)
+            .take_while(|_| producer.enqueue(StepMove::new(10, 1, 0)).is_ok())
+            .count();
+
+        assert_eq!(accepted, usize::from(move_count));
+    }
 
     #[test]
     fn get_config_no_crc() {
         let state = State::new();
-        let (is_config, crc, is_shutdown, move_count) = get_config(&state);
+        let (is_config, crc, is_shutdown, _) = get_config(&state);
         assert!(!is_config);
         assert_eq!(crc, 0);
         assert!(!is_shutdown);
-        assert_eq!(move_count, 1024);
     }
 
     #[test]

@@ -16,6 +16,9 @@ pub use heapless::spsc::{Consumer, Producer};
 
 use crate::stepper::StepMove;
 
+/// Depth of each board's hardware step/dir move queue.
+pub const STEP_QUEUE_DEPTH: usize = 1024;
+
 /// Owns one channel's step/dir move queue and its detachable `Consumer`.
 pub struct StepQueueChannel<const N: usize> {
     queue: UnsafeCell<Queue<StepMove, N>>,
