@@ -180,21 +180,6 @@ impl TrSyncRuntime {
         self.expire_active = true;
     }
 
-    /// Check if expire deadline has passed. Returns true if triggered.
-    /// `oid` is the TrSync OID for the report snapshot.
-    pub fn check_timeout(&mut self, oid: u8, now: u32) -> bool {
-        if !self.expire_active || !self.can_trigger {
-            return false;
-        }
-        let diff = now.wrapping_sub(self.expire_clock) as i32;
-        if diff >= 0 {
-            self.trigger(oid, self.expire_reason, now);
-            true
-        } else {
-            false
-        }
-    }
-
     /// Set report pending with a liveness snapshot. Only valid while
     /// can_trigger is true. Returns false if not armed.
     pub fn set_liveness_report(&mut self, oid: u8, clock: u32) -> bool {
@@ -314,34 +299,6 @@ mod tests {
         ts.clear_pending_report();
         assert!(!ts.report_pending());
         assert!(ts.take_report().is_none());
-    }
-
-    #[test]
-    fn timeout_not_fired_without_set_timeout() {
-        let mut ts = TrSyncRuntime::new();
-        ts.arm(0, 0, 5);
-        assert!(!ts.check_timeout(0, u32::MAX));
-        assert!(ts.can_trigger());
-    }
-
-    #[test]
-    fn timeout_fires_at_deadline() {
-        let mut ts = TrSyncRuntime::new();
-        ts.arm(0, 0, 5);
-        ts.set_timeout(1000);
-        assert!(!ts.check_timeout(0, 999));
-        assert!(ts.check_timeout(0, 1000));
-        assert!(!ts.can_trigger());
-        assert_eq!(ts.trigger_reason(), 5);
-    }
-
-    #[test]
-    fn timeout_wraparound() {
-        let mut ts = TrSyncRuntime::new();
-        ts.arm(0, 0, 0xBB);
-        ts.set_timeout(0xFFFF_FF00);
-        assert!(ts.check_timeout(0, 0x0000_0010));
-        assert_eq!(ts.trigger_reason(), 0xBB);
     }
 
     #[test]
