@@ -155,6 +155,9 @@ impl<const N: usize> StepQueueChannel<N> {
     }
 }
 
+// SAFETY (all `unsafe` calls below): each test owns its own `static`
+// channel, calls `split_once` on it first and only once, and runs on a single
+// thread, so every exclusive-access precondition holds trivially.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,10 +165,8 @@ mod tests {
     #[test]
     fn split_once_yields_a_working_producer_and_consumer() {
         static CHANNEL: StepQueueChannel<4> = StepQueueChannel::new();
-        // SAFETY: single call on a `'static` channel, first thing this test does.
         let mut producer = unsafe { CHANNEL.split_once() };
         producer.enqueue(StepMove::new(100, 1, 0)).unwrap();
-        // SAFETY: host test is single-threaded; nothing else touches CHANNEL.
         let dequeued = unsafe { CHANNEL.isr_dequeue() };
         assert_eq!(dequeued, Some(StepMove::new(100, 1, 0)));
     }

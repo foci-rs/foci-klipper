@@ -94,8 +94,11 @@ impl StepEventResult {
 /// constant (cruise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum PhaseClass {
+    /// `add < 0`: the step interval shrinks.
     Accel = 0,
+    /// `add == 0`: the step interval holds.
     Cruise = 1,
+    /// `add > 0`: the step interval grows.
     Decel = 2,
 }
 

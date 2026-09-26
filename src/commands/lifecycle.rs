@@ -71,6 +71,7 @@ mod tests {
         // Klipper shares move_count across all steppers on the MCU, so a
         // single channel can legitimately receive all of them.
         static CHANNEL: StepQueueChannel<STEP_QUEUE_DEPTH> = StepQueueChannel::new();
+        // SAFETY: first and only split of this test-owned `static` channel.
         let mut producer = unsafe { CHANNEL.split_once() };
         let (_, _, _, move_count) = get_config(&State::new());
 
