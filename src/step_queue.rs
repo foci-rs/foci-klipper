@@ -86,16 +86,16 @@ impl<const N: usize> StepQueueChannel<N> {
 
     /// Dequeue directly from the ISR-owned `Consumer`, with no locking.
     ///
+    /// Returns `None` while the consumer is detached: the detached holder owns
+    /// draining the queue, so the ISR must see it as empty and go idle.
+    ///
     /// # Safety
     ///
     /// Callable only from the P3 ISR context that owns this channel's timer
-    /// dispatch, and only while the consumer is attached.
+    /// dispatch.
     pub unsafe fn isr_dequeue(&self) -> Option<StepMove> {
-        // SAFETY: caller guarantees exclusive P3 access and an attached consumer.
-        let consumer = unsafe { (*self.consumer.get()).as_mut() };
-        consumer
-            .expect("isr_dequeue called while consumer is detached")
-            .dequeue()
+        // SAFETY: caller guarantees exclusive P3 access.
+        unsafe { (*self.consumer.get()).as_mut() }?.dequeue()
     }
 
     /// Detach the `Consumer`, for a caller about to drain it outside any
@@ -231,6 +231,20 @@ mod tests {
         let consumer = unsafe { CHANNEL.take_consumer() }.unwrap();
         let none_result = unsafe { CHANNEL.borrow_consumer_mut(|c| c.dequeue()) };
         assert_eq!(none_result, None);
+        unsafe { CHANNEL.give_consumer(consumer) };
+    }
+
+    #[test]
+    fn isr_dequeue_reports_no_move_while_consumer_is_detached() {
+        static CHANNEL: StepQueueChannel<4> = StepQueueChannel::new();
+        let mut producer = unsafe { CHANNEL.split_once() };
+        let consumer = unsafe { CHANNEL.take_consumer() }.unwrap();
+        producer.enqueue(StepMove::new(50, 1, 0)).unwrap();
+
+        let dequeued = unsafe { CHANNEL.isr_dequeue() };
+
+        assert_eq!(dequeued, None);
+        assert_eq!(CHANNEL.len(), 1);
         unsafe { CHANNEL.give_consumer(consumer) };
     }
 
