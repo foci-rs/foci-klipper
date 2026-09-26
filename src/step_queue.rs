@@ -19,6 +19,9 @@ use crate::stepper::StepMove;
 /// Depth of each board's hardware step/dir move queue.
 pub const STEP_QUEUE_DEPTH: usize = 1024;
 
+/// Moves one step queue can hold: `heapless::spsc` keeps one slot empty.
+pub const STEP_QUEUE_CAPACITY: usize = STEP_QUEUE_DEPTH - 1;
+
 /// Owns one channel's step/dir move queue and its detachable `Consumer`.
 pub struct StepQueueChannel<const N: usize> {
     queue: UnsafeCell<Queue<StepMove, N>>,

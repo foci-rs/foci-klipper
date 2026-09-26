@@ -3,10 +3,9 @@
 use crate::commands::ShutdownRequired;
 use crate::shutdown::McuState;
 use crate::state::State;
-use crate::step_queue::STEP_QUEUE_DEPTH;
+use crate::step_queue::STEP_QUEUE_CAPACITY;
 
-/// Moves the host may queue: `heapless::spsc` keeps one slot empty.
-const MOVE_COUNT: u16 = (STEP_QUEUE_DEPTH - 1) as u16;
+const MOVE_COUNT: u16 = STEP_QUEUE_CAPACITY as u16;
 
 /// Return protocol config state for `get_config` reply.
 ///
@@ -64,7 +63,7 @@ pub fn allocate_oids(_count: u8) {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::step_queue::StepQueueChannel;
+    use crate::step_queue::{STEP_QUEUE_DEPTH, StepQueueChannel};
     use crate::stepper::StepMove;
 
     #[test]
