@@ -38,15 +38,6 @@ impl StepMove {
             direction: true,
         }
     }
-
-    /// Returns the smallest logical interval used by this segment.
-    pub fn minimum_interval(&self) -> u32 {
-        if self.add >= 0 || self.count <= 1 {
-            return self.interval.max(1);
-        }
-        let last_offset = i64::from(self.add) * i64::from(self.count - 1);
-        (i64::from(self.interval) + last_offset).max(1) as u32
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -786,13 +777,6 @@ mod hardware_stepper_tests {
         stepper.configure_motion_scale(replacement).unwrap();
         assert_eq!(stepper.planner_steps_per_rev(), Some(4_000));
         assert_eq!(stepper.mapper_phase(), Some(2_000));
-    }
-
-    #[test]
-    fn minimum_interval_uses_acceleration_endpoint() {
-        assert_eq!(StepMove::new(100, 5, 20).minimum_interval(), 100);
-        assert_eq!(StepMove::new(100, 5, -20).minimum_interval(), 20);
-        assert_eq!(StepMove::new(50, u16::MAX, i16::MIN).minimum_interval(), 1);
     }
 
     #[test]
