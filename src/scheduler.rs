@@ -214,7 +214,7 @@ impl TriggerScheduler {
     /// Remove and return the earliest due event.
     ///
     /// If multiple events are due at `now`, this follows the same ordering
-    /// used by [`earliest_deadline`], so callers can repeatedly pop until it
+    /// used by [`Self::earliest_deadline`], so callers can repeatedly pop until it
     /// returns `None` and process all ready work in scheduler order.
     pub fn pop_due(&mut self, now: u32) -> Option<SchedulerEvent> {
         self.pop_due_slot(now).map(|slot| slot.event())
