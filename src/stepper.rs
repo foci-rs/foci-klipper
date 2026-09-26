@@ -329,7 +329,10 @@ impl HardwareStepper {
     ///
     /// GPIO transitions and pulse timing are owned by the board caller.
     pub fn step_event(&mut self) -> StepEventResult {
-        debug_assert!(self.current_count > 0);
+        assert!(
+            self.current_count > 0,
+            "step_event called without a loaded move"
+        );
         self.current_count -= 1;
         let signed_pulses = self
             .pulse_mapper
