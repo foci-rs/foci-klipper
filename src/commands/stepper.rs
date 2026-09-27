@@ -50,50 +50,26 @@ pub fn config_stepper_channel(state: &mut State, oid: u8, channel: u8) -> Result
 pub enum QueueStepResult {
     /// Move was silently discarded because `need_reset` is set.
     Discarded,
-    /// Move was queued normally.
-    Queued,
-    /// Move was queued and the queue was previously empty.
-    /// Caller may need to arm the timer if `motor_armed` is true.
-    QueuedFirstMove,
+    /// Move passed the reset and count checks; the caller may enqueue it.
+    Admitted,
 }
 
-/// Validate and prepare a `queue_step` command for hardware step/dir mode.
+/// Resolve the `queue_step` checks that depend only on the command itself.
 ///
-/// Checks `need_reset` (discard) and `count == 0` (error) before accepting
-/// the move. The actual SPSC enqueue and timer arming are done by the board
-/// crate caller — this function only validates.
-///
-/// `queue_was_empty` should reflect whether the SPSC queue was empty before
-/// the caller pushes this move.
-/// `motion_scale_configured` should reflect whether the logical-to-physical
-/// pulse mapper has been configured for this stepper.
+/// A pending `need_reset` discards the move, even a zero-count one.
 ///
 /// # Errors
 ///
 /// Returns [`CommandError::ZeroCount`] when `need_reset` is false and `count`
-/// is zero. Returns [`CommandError::MotionScaleUnconfigured`] when
-/// `need_reset` is false, `count` is positive, and `motion_scale_configured`
-/// is false.
-pub fn queue_step_hw(
-    need_reset: bool,
-    count: u16,
-    queue_was_empty: bool,
-    motion_scale_configured: bool,
-) -> Result<QueueStepResult, CommandError> {
+/// is zero.
+pub fn queue_step_hw(need_reset: bool, count: u16) -> Result<QueueStepResult, CommandError> {
     if need_reset {
         return Ok(QueueStepResult::Discarded);
     }
     if count == 0 {
         return Err(CommandError::ZeroCount);
     }
-    if !motion_scale_configured {
-        return Err(CommandError::MotionScaleUnconfigured);
-    }
-    if queue_was_empty {
-        Ok(QueueStepResult::QueuedFirstMove)
-    } else {
-        Ok(QueueStepResult::Queued)
-    }
+    Ok(QueueStepResult::Admitted)
 }
 
 /// Validate a `reset_step_clock` command for hardware step/dir mode.
@@ -213,33 +189,18 @@ mod tests {
     // --- Hardware step/dir command tests ---
 
     #[test]
-    fn queue_step_hw_need_reset_discards() {
-        let result = queue_step_hw(true, 10, false, false);
-        assert_eq!(result, Ok(QueueStepResult::Discarded));
+    fn queue_step_hw_need_reset_discards_even_zero_count() {
+        assert_eq!(queue_step_hw(true, 0), Ok(QueueStepResult::Discarded));
     }
 
     #[test]
     fn queue_step_hw_zero_count_errors() {
-        let result = queue_step_hw(false, 0, false, true);
-        assert_eq!(result, Err(CommandError::ZeroCount));
+        assert_eq!(queue_step_hw(false, 0), Err(CommandError::ZeroCount));
     }
 
     #[test]
-    fn queue_step_hw_normal_queued() {
-        let result = queue_step_hw(false, 10, false, true);
-        assert_eq!(result, Ok(QueueStepResult::Queued));
-    }
-
-    #[test]
-    fn queue_step_hw_first_move() {
-        let result = queue_step_hw(false, 10, true, true);
-        assert_eq!(result, Ok(QueueStepResult::QueuedFirstMove));
-    }
-
-    #[test]
-    fn queue_step_hw_requires_configured_motion_scale() {
-        let result = queue_step_hw(false, 10, true, false);
-        assert_eq!(result, Err(CommandError::MotionScaleUnconfigured));
+    fn queue_step_hw_admits_positive_count() {
+        assert_eq!(queue_step_hw(false, 10), Ok(QueueStepResult::Admitted));
     }
 
     #[test]
