@@ -119,9 +119,8 @@ impl PhaseClass {
 /// This struct holds two categories of state:
 /// - **ISR state** (`current_*`, `next_step_clock`, `was_active`, `dir_state`):
 ///   Only accessed by the P3 timer ISR via `load_move()` and `step_event()`.
-/// - **P2 state** (`last_dir`, `next_dir`): Only accessed by P2 command
-///   handlers via `set_next_step_dir()`, `next_move_changes_direction()`, and
-///   `prepare_move()`.
+/// - **P2 state** (`next_dir`): Only accessed by P2 command handlers via
+///   `set_next_step_dir()` and `prepare_move()`.
 ///
 /// The move queue and atomic flags live outside this struct as statics
 /// in the board crate (see spec: Concurrency Model).
@@ -151,8 +150,6 @@ pub struct HardwareStepper {
     pulse_mapper: Option<ReversiblePulseMapper>,
 
     // --- P2 state (command handlers only) ---
-    /// Direction of the most recently queued move (Klipper `SF_LAST_DIR`).
-    last_dir: bool,
     /// Direction for the next queued move (Klipper `SF_NEXT_DIR`).
     next_dir: bool,
 }
@@ -176,7 +173,6 @@ impl HardwareStepper {
             dir_setup_pending: true,
             last_phase_class: None,
             pulse_mapper: None,
-            last_dir: true,
             next_dir: true,
         }
     }
@@ -190,23 +186,12 @@ impl HardwareStepper {
         self.next_dir = forward;
     }
 
-    /// Returns whether the next queued move would change direction.
-    ///
-    /// This preview does not consume the pending direction change. A subsequent
-    /// [`prepare_move`](Self::prepare_move) call records and consumes it.
-    pub const fn next_move_changes_direction(&self) -> bool {
-        self.last_dir != self.next_dir
-    }
-
     /// Prepare a move for queuing by attaching direction state.
     ///
     /// Called from P2 `queue_step` command handler. Returns the amended
     /// [`StepMove`] with the absolute direction selected for the queued move.
     /// The caller pushes the result to the SPSC queue.
-    pub fn prepare_move(&mut self, m: StepMove) -> StepMove {
-        if self.last_dir != self.next_dir {
-            self.last_dir = self.next_dir;
-        }
+    pub fn prepare_move(&self, m: StepMove) -> StepMove {
         StepMove {
             direction: self.next_dir,
             ..m
@@ -472,22 +457,6 @@ mod hardware_stepper_tests {
         isr_stepper.load_move(next);
 
         assert!(!isr_stepper.step_event().event().direction);
-    }
-
-    #[test]
-    fn direction_change_preview_tracks_pending_move_without_consuming_it() {
-        let mut stepper = HardwareStepper::new();
-        assert!(!stepper.next_move_changes_direction());
-
-        stepper.set_next_step_dir(false);
-        assert!(stepper.next_move_changes_direction());
-        assert!(stepper.next_move_changes_direction());
-
-        stepper.prepare_move(StepMove::new(100, 1, 0));
-        assert!(!stepper.next_move_changes_direction());
-
-        stepper.set_next_step_dir(true);
-        assert!(stepper.next_move_changes_direction());
     }
 
     #[test]
