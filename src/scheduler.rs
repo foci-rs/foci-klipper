@@ -267,9 +267,7 @@ impl TriggerScheduler {
 
     /// Clear all events.
     pub fn clear(&mut self) {
-        for slot in &mut self.nodes {
-            *slot = None;
-        }
+        self.nodes.fill(None);
         self.head = NIL;
         self.cc2_active = false;
     }
