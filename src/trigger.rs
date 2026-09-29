@@ -71,6 +71,8 @@ pub struct TrSyncRuntime {
     report_snapshot: Option<ReportSnapshot>,
     expire_clock: u32,
     expire_active: bool,
+    /// Periodic report interval; 0 means no periodic reports, as in Klipper's
+    /// `trsync_start`.
     report_ticks: u32,
     report_clock: u32,
 }
@@ -145,6 +147,7 @@ impl TrSyncRuntime {
         self.expire_active
     }
 
+    /// Periodic report interval in ticks; 0 means no periodic reports.
     pub fn report_ticks(&self) -> u32 {
         self.report_ticks
     }

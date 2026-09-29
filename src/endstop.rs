@@ -28,12 +28,33 @@ pub enum EndstopSampleResult {
     Triggered { trsync_oid: u8, reason: u8 },
 }
 
+/// Arguments of Klipper's `endstop_home` command, plus the board's pin id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct HomingConfig {
+    /// Clock of the first sample.
+    pub clock: u32,
+    /// Interval between oversampling reads.
+    pub sample_ticks: u32,
+    /// Consecutive matching reads required to trigger; 0 disarms.
+    pub sample_count: u8,
+    /// Interval between scan reads.
+    pub rest_ticks: u32,
+    /// Pin level that counts as triggered.
+    pub pin_value: bool,
+    /// Trsync signalled on trigger.
+    pub trsync_oid: u8,
+    /// Reason code reported to the trsync.
+    pub trigger_reason: u8,
+    /// Board pin id reported by query-state.
+    pub pin_id: u8,
+}
+
 /// Two-phase endstop state machine.
 #[derive(Debug, defmt::Format)]
 pub struct EndstopRuntime {
     phase: EndstopPhase,
     pin_value: bool,
-    homing: bool,
+    armed: bool,
     trigger_count: u8,
     sample_count: u8,
     sample_ticks: u32,
@@ -49,7 +70,7 @@ impl EndstopRuntime {
         Self {
             phase: EndstopPhase::Scanning,
             pin_value: false,
-            homing: false,
+            armed: false,
             trigger_count: 0,
             sample_count: 0,
             sample_ticks: 0,
@@ -61,8 +82,12 @@ impl EndstopRuntime {
         }
     }
 
-    pub fn is_homing(&self) -> bool {
-        self.homing
+    /// True from a non-zero-count `start_homing` until a zero-count one.
+    ///
+    /// Stays true after the endstop triggers; Klipper's `endstop_query_state`
+    /// reports it as `homing` in that state too.
+    pub fn is_armed(&self) -> bool {
+        self.armed
     }
 
     pub fn phase(&self) -> EndstopPhase {
@@ -77,39 +102,28 @@ impl EndstopRuntime {
         self.pin_id
     }
 
-    /// Arm the endstop for homing. sample_count=0 disarms.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_homing(
-        &mut self,
-        clock: u32,
-        sample_ticks: u32,
-        sample_count: u8,
-        rest_ticks: u32,
-        pin_value: bool,
-        trsync_oid: u8,
-        trigger_reason: u8,
-        pin_id: u8,
-    ) {
-        if sample_count == 0 {
-            self.homing = false;
+    /// Arm the endstop for homing. `sample_count == 0` disarms.
+    pub fn start_homing(&mut self, cfg: HomingConfig) {
+        if cfg.sample_count == 0 {
+            self.armed = false;
             return;
         }
         self.phase = EndstopPhase::Scanning;
-        self.pin_value = pin_value;
-        self.homing = true;
-        self.trigger_count = sample_count;
-        self.sample_count = sample_count;
-        self.sample_ticks = sample_ticks;
-        self.rest_ticks = rest_ticks;
-        self.nextwake = clock;
-        self.trsync_oid = trsync_oid;
-        self.trigger_reason = trigger_reason;
-        self.pin_id = pin_id;
+        self.pin_value = cfg.pin_value;
+        self.armed = true;
+        self.trigger_count = cfg.sample_count;
+        self.sample_count = cfg.sample_count;
+        self.sample_ticks = cfg.sample_ticks;
+        self.rest_ticks = cfg.rest_ticks;
+        self.nextwake = cfg.clock;
+        self.trsync_oid = cfg.trsync_oid;
+        self.trigger_reason = cfg.trigger_reason;
+        self.pin_id = cfg.pin_id;
     }
 
     /// Scanning phase. Called at rest_ticks intervals.
     pub fn scan(&mut self, pin_state: bool, waketime: u32) -> EndstopSampleResult {
-        if !self.homing {
+        if !self.armed {
             return EndstopSampleResult::Inactive;
         }
         let next_scan = waketime.wrapping_add(self.rest_ticks);
@@ -145,9 +159,9 @@ impl EndstopRuntime {
         }
     }
 
-    /// Return query state: (homing, nextwake).
+    /// Return query state: (armed, nextwake).
     pub fn query_state(&self) -> (bool, u32) {
-        (self.homing, self.nextwake)
+        (self.armed, self.nextwake)
     }
 
     /// Full reset to unconfigured state.
@@ -168,20 +182,29 @@ mod tests {
 
     fn armed_endstop() -> EndstopRuntime {
         let mut e = EndstopRuntime::new();
-        e.start_homing(1000, 50, 4, 500, true, 7, 42, 0x10);
+        e.start_homing(HomingConfig {
+            clock: 1000,
+            sample_ticks: 50,
+            sample_count: 4,
+            rest_ticks: 500,
+            pin_value: true,
+            trsync_oid: 7,
+            trigger_reason: 42,
+            pin_id: 0x10,
+        });
         e
     }
 
     #[test]
-    fn new_endstop_not_homing() {
+    fn new_endstop_not_armed() {
         let e = EndstopRuntime::new();
-        assert!(!e.is_homing());
+        assert!(!e.is_armed());
     }
 
     #[test]
     fn start_homing_arms() {
         let e = armed_endstop();
-        assert!(e.is_homing());
+        assert!(e.is_armed());
         assert_eq!(e.phase(), EndstopPhase::Scanning);
         assert_eq!(e.nextwake(), 1000);
     }
@@ -189,8 +212,17 @@ mod tests {
     #[test]
     fn start_homing_zero_disarms() {
         let mut e = armed_endstop();
-        e.start_homing(0, 0, 0, 0, false, 0, 0, 0);
-        assert!(!e.is_homing());
+        e.start_homing(HomingConfig {
+            clock: 0,
+            sample_ticks: 0,
+            sample_count: 0,
+            rest_ticks: 0,
+            pin_value: false,
+            trsync_oid: 0,
+            trigger_reason: 0,
+            pin_id: 0,
+        });
+        assert!(!e.is_armed());
     }
 
     #[test]
@@ -244,14 +276,14 @@ mod tests {
     }
 
     #[test]
-    fn homing_stays_true_after_trigger() {
+    fn armed_stays_true_after_trigger() {
         let mut e = armed_endstop();
         e.scan(true, 1000);
         e.oversample(true, 1000);
         e.oversample(true, 1050);
         e.oversample(true, 1100);
         e.oversample(true, 1150);
-        assert!(e.is_homing());
+        assert!(e.is_armed());
     }
 
     #[test]
@@ -276,7 +308,16 @@ mod tests {
     #[test]
     fn clock_wraparound_scan() {
         let mut e = EndstopRuntime::new();
-        e.start_homing(0xFFFF_FF00, 50, 3, 100, true, 1, 1, 0x10);
+        e.start_homing(HomingConfig {
+            clock: 0xFFFF_FF00,
+            sample_ticks: 50,
+            sample_count: 3,
+            rest_ticks: 100,
+            pin_value: true,
+            trsync_oid: 1,
+            trigger_reason: 1,
+            pin_id: 0x10,
+        });
         let result = e.scan(false, 0xFFFF_FF00);
         assert_eq!(
             result,
@@ -287,10 +328,10 @@ mod tests {
     }
 
     #[test]
-    fn query_state_returns_homing_and_nextwake() {
+    fn query_state_returns_armed_and_nextwake() {
         let e = armed_endstop();
-        let (homing, nextwake) = e.query_state();
-        assert!(homing);
+        let (armed, nextwake) = e.query_state();
+        assert!(armed);
         assert_eq!(nextwake, 1000);
     }
 }
