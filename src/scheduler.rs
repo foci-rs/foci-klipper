@@ -370,7 +370,6 @@ mod tests {
                 wake_clock: 0xFFFF_FF00,
             },
         );
-        // 0xFFFFFF00 is earlier than 0x100 in signed wraparound
         assert_eq!(s.earliest_deadline(), Some(0xFFFF_FF00));
     }
 

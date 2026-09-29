@@ -1,9 +1,6 @@
 //! Explicit producer/consumer ownership for hardware step/dir move queues.
 //!
-//! Replaces deriving a fresh `&'static mut Queue` from a `static mut`
-//! array on every access, which is unsound under Rust's aliasing model
-//! regardless of the RTIC-priority access discipline it relied on. This
-//! type never depends on `cortex_m` and stays fully host-testable — the
+//! This type never depends on `cortex_m` and stays fully host-testable — the
 //! interrupt masking that makes `take_consumer`/`give_consumer`/
 //! `borrow_consumer_mut` sound is supplied by a small board-local wrapper,
 //! not by this type.
@@ -11,7 +8,6 @@
 use core::cell::UnsafeCell;
 
 use heapless::spsc::Queue;
-// Re-exported: board crates reference these as `foci_klipper::step_queue::{Producer, Consumer}`.
 pub use heapless::spsc::{Consumer, Producer};
 
 use crate::stepper::StepMove;
@@ -189,7 +185,6 @@ mod tests {
         producer.enqueue(StepMove::new(50, 1, 0)).unwrap();
         let consumer = unsafe { CHANNEL.take_consumer() };
         assert!(consumer.is_some());
-        // Length is still readable with no consumer attached.
         assert_eq!(CHANNEL.len(), 1);
         unsafe { CHANNEL.give_consumer(consumer.unwrap()) };
         assert_eq!(CHANNEL.len(), 1);
@@ -208,18 +203,11 @@ mod tests {
     fn give_consumer_panics_when_the_slot_is_already_occupied() {
         static CHANNEL: StepQueueChannel<4> = StepQueueChannel::new();
         let _producer = unsafe { CHANNEL.split_once() };
-        // CHANNEL's own consumer is still attached (never taken) -- the slot
-        // is genuinely occupied.
 
-        // Mint an unrelated Consumer<'static, StepMove> from a throwaway
-        // queue, just to have a second, distinct Consumer value to attempt
-        // to give -- `Consumer` isn't `Clone`, so there is no other way to
-        // get a second value to pass while the first is still attached.
         static OTHER_QUEUE: StepQueueChannel<4> = StepQueueChannel::new();
         let _other_producer = unsafe { OTHER_QUEUE.split_once() };
         let other_consumer = unsafe { OTHER_QUEUE.take_consumer() }.unwrap();
 
-        // CHANNEL's slot is still occupied by its own consumer -- this must panic.
         unsafe { CHANNEL.give_consumer(other_consumer) };
     }
 
@@ -257,15 +245,10 @@ mod tests {
         static CHANNEL: StepQueueChannel<1024> = StepQueueChannel::new();
         let mut producer = unsafe { CHANNEL.split_once() };
 
-        // count=2 (not 1) so the step-total assertion below is distinct
-        // from the segment-count assertion -- summing 1s would not catch
-        // a regression that dropped the count accumulation entirely.
         let mut enqueued = 0usize;
         while producer.enqueue(StepMove::new(10, 2, 0)).is_ok() {
             enqueued += 1;
         }
-        // heapless::spsc reserves one slot for full/empty disambiguation,
-        // so usable capacity is N - 1.
         assert_eq!(enqueued, 1023);
         assert_eq!(CHANNEL.len(), 1023);
 
@@ -282,8 +265,6 @@ mod tests {
 
         unsafe { CHANNEL.give_consumer(consumer) };
 
-        // Prove the channel is still fully usable after a full-capacity
-        // detach/reattach cycle, not just that the cycle itself completes.
         producer.enqueue(StepMove::new(20, 1, 0)).unwrap();
         let redequeued = unsafe { CHANNEL.isr_dequeue() };
         assert_eq!(redequeued, Some(StepMove::new(20, 1, 0)));

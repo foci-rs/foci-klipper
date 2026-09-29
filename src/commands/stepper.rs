@@ -41,10 +41,6 @@ pub fn config_stepper_channel(state: &mut State, oid: u8, channel: u8) -> Result
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Hardware step/dir command helpers
-// ---------------------------------------------------------------------------
-
 /// Result of a `queue_step` command for hardware step/dir mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueStepResult {
@@ -185,8 +181,6 @@ mod tests {
         assert_eq!(state.stepper_channel(5), Some(0));
         assert_eq!(state.stepper_channel(6), Some(1));
     }
-
-    // --- Hardware step/dir command tests ---
 
     #[test]
     fn queue_step_hw_need_reset_discards_even_zero_count() {

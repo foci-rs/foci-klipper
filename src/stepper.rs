@@ -19,10 +19,6 @@ pub struct StepMove {
     pub count: u16,
     /// Interval change per step (acceleration).
     pub add: i16,
-    /// Absolute DIR level for this segment.
-    ///
-    /// Storing the level rather than a relative toggle keeps later segments
-    /// correct when a stop path discards queued moves.
     direction: bool,
 }
 impl StepMove {
@@ -39,10 +35,6 @@ impl StepMove {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Hardware step/dir stepper
-// ---------------------------------------------------------------------------
 
 /// A logical planner step and its board-owned physical pulse work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -125,32 +117,16 @@ impl PhaseClass {
 /// The move queue and atomic flags live outside this struct as statics
 /// in the board crate (see spec: Concurrency Model).
 pub struct HardwareStepper {
-    // --- ISR state (P3 only) ---
-    /// Current segment interval (ticks between steps).
     current_interval: u32,
-    /// Logical planner steps remaining in the current segment.
     current_count: u16,
-    /// Interval change per step (acceleration).
     current_add: i16,
-    /// Clock time of the next step.
     next_step_clock: u32,
-    /// Whether the stepper was active before loading the current segment.
-    /// Used for missed-deadline check (Klipper `was_active` semantics).
     was_active: bool,
-    /// Direction used by the current or most recent ISR move.
     dir_state: bool,
-    /// Whether the next logical event must establish the board-owned DIR level.
     dir_setup_pending: bool,
-    /// Phase class of the most recently loaded segment, for phase-boundary
-    /// marker detection. `None` when no segment has been loaded since the
-    /// last `reset()`/`mark_idle()` — a fresh move has no valid prior phase
-    /// to compare against.
     last_phase_class: Option<PhaseClass>,
-    /// Stateful logical-to-physical pulse mapper.
     pulse_mapper: Option<ReversiblePulseMapper>,
 
-    // --- P2 state (command handlers only) ---
-    /// Direction for the next queued move (Klipper `SF_NEXT_DIR`).
     next_dir: bool,
 }
 
@@ -159,6 +135,9 @@ impl Default for HardwareStepper {
         Self::new()
     }
 }
+
+/// Ticks past `now` at which a late-but-tolerated step is rescheduled.
+const MIN_DEADLINE_TICKS: u32 = 2;
 
 impl HardwareStepper {
     /// Create a new stepper in idle state.
@@ -176,8 +155,6 @@ impl HardwareStepper {
             next_dir: true,
         }
     }
-
-    // --- P2 methods (command handlers) ---
 
     /// Set direction for the next queued move.
     ///
@@ -286,8 +263,6 @@ impl HardwareStepper {
         self.pulse_mapper.as_ref().map(ReversiblePulseMapper::phase)
     }
 
-    // --- P3 methods (timer ISR) ---
-
     /// Load a move segment from the queue into the active segment.
     ///
     /// Called from P3 timer ISR when the previous segment is exhausted.
@@ -353,7 +328,7 @@ impl HardwareStepper {
     /// Matches Klipper `stepper_load_next()` missed-deadline logic:
     /// - `was_active = false` (first activation): no shutdown check
     /// - `was_active = true` and >1ms past: return Err (caller shuts down)
-    /// - `was_active = true` and 0-1ms past: nudge to `now + min_ticks`
+    /// - `was_active = true` and 0-1ms past: nudge to `now + MIN_DEADLINE_TICKS`
     ///
     /// If this returns an adjusted immediate clock, callers must schedule that
     /// compare without rebasing `next_step_clock`. Klipper keeps the original
@@ -369,31 +344,24 @@ impl HardwareStepper {
         clock_freq: u32,
     ) -> Result<u32, MissedDeadline> {
         if !self.was_active {
-            // First activation after idle: no past-time check.
-            // Fire immediately if past, or at scheduled time if future.
             let diff = (now as i32).wrapping_sub(scheduled as i32);
             if diff >= 0 {
-                // Past or now: fire immediately (small future offset).
-                return Ok(now.wrapping_add(2));
+                return Ok(now.wrapping_add(MIN_DEADLINE_TICKS));
             }
             return Ok(scheduled);
         }
 
         let diff = (scheduled as i32).wrapping_sub(now as i32);
         if diff >= 0 {
-            // Scheduled time is in the future — normal case.
             return Ok(scheduled);
         }
 
-        // Scheduled time is in the past.
-        let threshold = (clock_freq / 1000) as i32; // 1ms in timer ticks
+        let threshold = (clock_freq / 1000) as i32;
         if diff < -threshold {
-            // More than 1ms past: fatal.
             return Err(MissedDeadline);
         }
 
-        // Within 1ms: nudge to now + minimum offset.
-        Ok(now.wrapping_add(2))
+        Ok(now.wrapping_add(MIN_DEADLINE_TICKS))
     }
 
     /// Current step interval (clock ticks between steps).
@@ -596,8 +564,6 @@ mod hardware_stepper_tests {
         stepper.load_move(StepMove::new(100, 5, -1));
         stepper.load_move(StepMove::new(100, 5, 1));
         stepper.reset();
-        // Next move's first segment is also Decel, but reset() must have
-        // cleared last_phase_class, so this must NOT report a transition.
         assert_eq!(stepper.load_move(StepMove::new(100, 5, 1)), None);
     }
 

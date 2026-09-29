@@ -31,27 +31,16 @@ pub enum EndstopSampleResult {
 /// Two-phase endstop state machine.
 #[derive(Debug, defmt::Format)]
 pub struct EndstopRuntime {
-    /// Current sampling phase.
     phase: EndstopPhase,
-    /// Pin level that indicates trigger.
     pin_value: bool,
-    /// ESF_HOMING equivalent. NOT cleared on trigger.
     homing: bool,
-    /// Consecutive match countdown (starts at sample_count).
     trigger_count: u8,
-    /// Total consecutive matches required.
     sample_count: u8,
-    /// Fast oversampling interval (C: sample_time).
     sample_ticks: u32,
-    /// Slow scanning interval (C: rest_time).
     rest_ticks: u32,
-    /// Scan-rate fallback wake time. Returned by endstop_query_state.
     nextwake: u32,
-    /// TrSync OID to trigger on confirmed match.
     trsync_oid: u8,
-    /// Reason code for TrSync trigger.
     trigger_reason: u8,
-    /// Configured GPIO pin ID (copied for query snapshot).
     pin_id: u8,
 }
 
@@ -129,7 +118,6 @@ impl EndstopRuntime {
                 next_clock: next_scan,
             };
         }
-        // Match: save nextwake, enter oversampling.
         self.nextwake = next_scan;
         self.phase = EndstopPhase::Oversampling;
         EndstopSampleResult::EnterOversamplingNow
@@ -139,7 +127,6 @@ impl EndstopRuntime {
     /// First call is immediate after scan() match (double-read).
     pub fn oversample(&mut self, pin_state: bool, waketime: u32) -> EndstopSampleResult {
         if pin_state != self.pin_value {
-            // Mismatch: return to scanning at saved nextwake.
             self.phase = EndstopPhase::Scanning;
             self.trigger_count = self.sample_count;
             return EndstopSampleResult::Reschedule {
@@ -148,7 +135,6 @@ impl EndstopRuntime {
         }
         self.trigger_count -= 1;
         if self.trigger_count == 0 {
-            // Confirmed. homing stays true (ESF_HOMING lifecycle).
             return EndstopSampleResult::Triggered {
                 trsync_oid: self.trsync_oid,
                 reason: self.trigger_reason,
@@ -221,13 +207,13 @@ mod tests {
         let result = e.scan(true, 1000);
         assert_eq!(result, EndstopSampleResult::EnterOversamplingNow);
         assert_eq!(e.phase(), EndstopPhase::Oversampling);
-        assert_eq!(e.nextwake(), 1500); // saved scan fallback
+        assert_eq!(e.nextwake(), 1500);
     }
 
     #[test]
     fn oversample_mismatch_returns_to_scanning() {
         let mut e = armed_endstop();
-        e.scan(true, 1000); // enter oversample
+        e.scan(true, 1000);
         let result = e.oversample(false, 1000);
         assert_eq!(result, EndstopSampleResult::Reschedule { next_clock: 1500 });
         assert_eq!(e.phase(), EndstopPhase::Scanning);
@@ -235,22 +221,18 @@ mod tests {
 
     #[test]
     fn oversample_counts_down_to_trigger() {
-        let mut e = armed_endstop(); // sample_count=4
-        e.scan(true, 1000); // enter oversample, nextwake=1500
+        let mut e = armed_endstop();
+        e.scan(true, 1000);
 
-        // First oversample (double-read at same instant)
         let r = e.oversample(true, 1000);
         assert_eq!(r, EndstopSampleResult::Reschedule { next_clock: 1050 });
 
-        // Second oversample
         let r = e.oversample(true, 1050);
         assert_eq!(r, EndstopSampleResult::Reschedule { next_clock: 1100 });
 
-        // Third oversample
         let r = e.oversample(true, 1100);
         assert_eq!(r, EndstopSampleResult::Reschedule { next_clock: 1150 });
 
-        // Fourth oversample — triggers
         let r = e.oversample(true, 1150);
         assert_eq!(
             r,
@@ -268,8 +250,8 @@ mod tests {
         e.oversample(true, 1000);
         e.oversample(true, 1050);
         e.oversample(true, 1100);
-        e.oversample(true, 1150); // triggers
-        assert!(e.is_homing()); // ESF_HOMING stays true
+        e.oversample(true, 1150);
+        assert!(e.is_homing());
     }
 
     #[test]
@@ -281,13 +263,13 @@ mod tests {
     #[test]
     fn nextwake_initialized_on_arm() {
         let e = armed_endstop();
-        assert_eq!(e.nextwake(), 1000); // first wake clock
+        assert_eq!(e.nextwake(), 1000);
     }
 
     #[test]
     fn nextwake_updated_on_oversample_entry() {
         let mut e = armed_endstop();
-        e.scan(true, 2000); // nextwake = 2000 + 500 = 2500
+        e.scan(true, 2000);
         assert_eq!(e.nextwake(), 2500);
     }
 

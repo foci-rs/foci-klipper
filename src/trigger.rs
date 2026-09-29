@@ -62,26 +62,16 @@ impl Default for StepperStopRuntime {
     }
 }
 
-/// TrSync runtime state using flags (not enum), matching C's
-/// TSF_CAN_TRIGGER / TSF_REPORT model.
+/// TrSync runtime state.
 pub struct TrSyncRuntime {
-    /// Equivalent to TSF_CAN_TRIGGER. Set by arm(), cleared by first trigger.
     can_trigger: bool,
-    /// First trigger reason, preserved across multiple trsync_trigger calls.
     trigger_reason: u8,
-    /// Reason code for timeout expiry.
     expire_reason: u8,
-    /// Report pending flag. Consumed by report sender task.
     report_pending: bool,
-    /// Snapshot for the pending report.
     report_snapshot: Option<ReportSnapshot>,
-    /// Expire timer deadline (MCU clock ticks).
     expire_clock: u32,
-    /// Whether expire timer is active.
     expire_active: bool,
-    /// Report timer interval. 0 = no reports.
     report_ticks: u32,
-    /// Next report timer deadline.
     report_clock: u32,
 }
 
